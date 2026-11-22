@@ -1,0 +1,42 @@
+{
+  "name": "market-sentinel",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.20.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=26.0.0 <27"
+  },
+  "scripts": {
+    "dev": "tsc -b apps/server && concurrently -k -n types,server,web \"tsc -b apps/server -w --preserveWatchOutput\" \"node --enable-source-maps --watch apps/server/dist/bootstrap.js\" \"vite apps/web\"",
+    "start": "node --enable-source-maps apps/server/dist/bootstrap.js",
+    "typecheck": "tsc -b",
+    "lint": "eslint .",
+    "format": "prettier --write apps packages development-plan README.md \"*.json\" \"*.mjs\"",
+    "format:check": "prettier --check apps packages development-plan README.md \"*.json\" \"*.mjs\"",
+    "test": "tsc -b apps/server && vitest run --pool=threads",
+    "build": "tsc -b && vite build apps/web",
+    "db:generate": "drizzle-kit generate --config apps/server/drizzle.config.ts",
+    "db:migrate": "tsc -b apps/server && node apps/server/dist/bootstrap.js migrate",
+    "admin:init": "tsc -b apps/server && node apps/server/dist/bootstrap.js admin:init"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@types/node": "^26.0.0",
+    "concurrently": "^9.2.0",
+    "eslint": "^9.39.0",
+    "prettier": "^3.6.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.50.0",
+    "vite": "^8.0.0",
+    "vitest": "^4.1.0"
+  },
+  "prettier": {
+    "singleQuote": true,
+    "trailingComma": "all"
+  }
+}
