@@ -84,7 +84,7 @@ describe('SQLite and health checks', () => {
         .prepare('SELECT COUNT(*) AS count FROM __drizzle_migrations')
         .get(),
     ).toMatchObject({
-      count: 2,
+      count: 3,
     });
 
     const ready = await app.inject('/health/ready');

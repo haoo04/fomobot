@@ -6,6 +6,11 @@ import {
   monitorPatchSchema,
 } from '@market-sentinel/contracts/markets';
 import type { Market, MonitorConfig } from '@market-sentinel/contracts/markets';
+import {
+  signalQuerySchema,
+  strategyParametersSchema,
+} from '@market-sentinel/contracts/strategies';
+import { MARKET_TYPES } from '@market-sentinel/domain';
 import { eq, inArray } from 'drizzle-orm';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -13,6 +18,14 @@ import { ApiError } from '../api-error.js';
 import { requireSession } from '../auth.js';
 import type { AppDatabase } from '../database.js';
 import { auditLogs, monitorConfigs } from '../schema.js';
+import type { StrategyService } from '../strategy/service.js';
+import {
+  listSignals,
+  saveStrategyVersion,
+  signalDetail,
+  strategyConfiguration,
+  strategyTemplate,
+} from '../strategy/store.js';
 import { monitoredTimeframes } from './model.js';
 import type { MarketData } from './service.js';
 import { configuredMarkets, marketById, marketPage } from './store.js';
@@ -26,7 +39,7 @@ function validated<T>(schema: z.ZodType<T>, value: unknown): T {
     throw new ApiError(
       400,
       'INVALID_REQUEST',
-      '请检查市场或监控参数。',
+      '请检查请求参数。',
       result.error.issues.map((issue) => ({
         field: issue.path.join('.'),
         code: issue.code,
@@ -67,6 +80,7 @@ export function registerMarketRoutes(
   app: FastifyInstance,
   database: AppDatabase,
   service: MarketData,
+  strategies: StrategyService,
   timeZone: string,
 ) {
   const actor = (request: FastifyRequest) =>
@@ -89,6 +103,15 @@ export function registerMarketRoutes(
     return row;
   }
 
+  const listMonitors = () =>
+    service.listMonitors().map((monitor) => ({
+      ...monitor,
+      strategy: strategies.describe(
+        requireMonitor(monitor.id),
+        monitor.market.marketType,
+      ),
+    }));
+
   function ensureCurrent(before: MonitorRow) {
     if (JSON.stringify(requireMonitor(before.id)) !== JSON.stringify(before)) {
       throw new ApiError(
@@ -99,7 +122,7 @@ export function registerMarketRoutes(
     }
   }
 
-  function ensureCapacity(changes: MonitorRow[]) {
+  function ensureCapacity(changes: Array<MonitorConfig & { id: string }>) {
     const next = new Map(changes.map((change) => [change.id, change]));
     const selected = configuredMarkets(database).map(({ config, market }) => {
       const replacement = next.get(config.id);
@@ -168,7 +191,7 @@ export function registerMarketRoutes(
 
   app.get('/monitors', async (request) => {
     actor(request);
-    return { requestId: request.id, data: service.listMonitors() };
+    return { requestId: request.id, data: listMonitors() };
   });
 
   app.post('/monitors', async (request, reply) => {
@@ -191,7 +214,9 @@ export function registerMarketRoutes(
       if (existing)
         throw new ApiError(409, 'MONITOR_EXISTS', '此市场已有监控配置。');
       ensureCapacity([config]);
-      tx.insert(monitorConfigs).values(config).run();
+      tx.insert(monitorConfigs)
+        .values({ ...config, strategyAfterMs: service.now() })
+        .run();
       tx.insert(auditLogs)
         .values(auditRow(username, 'MONITOR_CREATED', config.id))
         .run();
@@ -199,14 +224,14 @@ export function registerMarketRoutes(
     service.reconcile();
     return reply.code(201).send({
       requestId: request.id,
-      data: service.listMonitors().find((monitor) => monitor.id === config.id),
+      data: listMonitors().find((monitor) => monitor.id === config.id),
     });
   });
 
   app.patch('/monitors/:id', async (request) => {
     const username = actor(request);
     const { id } = validated(idParameter, request.params);
-    const patch = validated(monitorPatchSchema, request.body);
+    const { strategy, ...patch } = validated(monitorPatchSchema, request.body);
     const before = requireMonitor(id);
     const candidate = {
       ...before,
@@ -224,26 +249,71 @@ export function registerMarketRoutes(
         requireMarket(before.marketId),
         monitoredTimeframes(candidate),
       );
-    database.transaction((tx) => {
+    const resetStrategy = database.transaction((tx) => {
       ensureCurrent(before);
-      if (needsValidation)
-        ensureSupported(
-          service.view(requireMarket(before.marketId)),
-          candidate,
+      const market = requireMarket(before.marketId);
+      if (needsValidation) {
+        ensureSupported(service.view(market), candidate);
+        if (candidate.enabled) ensureCapacity([candidate]);
+      }
+
+      const periodsChanged =
+        before.trigger !== candidate.trigger ||
+        before.confirm !== candidate.confirm ||
+        before.trend !== candidate.trend;
+      const { marketType } = market;
+      if (
+        strategy &&
+        (marketType === 'SPOT'
+          ? strategy.params.oi !== null
+          : strategy.params.oi === null)
+      )
+        throw new ApiError(
+          422,
+          'INVALID_STRATEGY_OI',
+          '永续策略需要 OI 参数，现货策略的 OI 为 N/A。',
         );
-      if (candidate.enabled) ensureCapacity([candidate]);
+
+      if (strategy || (periodsChanged && before.strategyConfigVersionId)) {
+        const config = strategyConfiguration(tx, before, marketType);
+        if (strategy) {
+          config.params = strategy.params;
+          candidate.strategyEnabled = strategy.enabled;
+        }
+        candidate.strategyConfigVersionId = saveStrategyVersion(
+          tx,
+          config,
+          candidate,
+          service.now(),
+        ).id;
+      }
+      const changed =
+        periodsChanged ||
+        before.enabled !== candidate.enabled ||
+        before.strategyEnabled !== candidate.strategyEnabled ||
+        before.strategyConfigVersionId !== candidate.strategyConfigVersionId;
+      if (changed) candidate.strategyAfterMs = service.now();
+
       tx.update(monitorConfigs)
         .set(candidate)
         .where(eq(monitorConfigs.id, id))
         .run();
       tx.insert(auditLogs)
-        .values(auditRow(username, 'MONITOR_UPDATED', id))
+        .values(
+          auditRow(
+            username,
+            strategy ? 'MONITOR_STRATEGY_UPDATED' : 'MONITOR_UPDATED',
+            id,
+          ),
+        )
         .run();
+      return changed;
     });
-    service.reconcile();
+    if (resetStrategy) strategies.forget(id);
+    if (Object.keys(patch).length) service.reconcile();
     return {
       requestId: request.id,
-      data: service.listMonitors().find((item) => item.id === id),
+      data: listMonitors().find((item) => item.id === id),
     };
   });
 
@@ -273,6 +343,14 @@ export function registerMarketRoutes(
         .set({ enabled })
         .where(inArray(monitorConfigs.id, ids))
         .run();
+      const resumed = enabled
+        ? previous.filter((row) => !row.enabled).map((row) => row.id)
+        : [];
+      if (resumed.length)
+        tx.update(monitorConfigs)
+          .set({ strategyAfterMs: service.now() })
+          .where(inArray(monitorConfigs.id, resumed))
+          .run();
       tx.insert(auditLogs)
         .values(
           ids.map((id) =>
@@ -285,11 +363,13 @@ export function registerMarketRoutes(
         )
         .run();
     });
+    for (const row of previous)
+      if (row.enabled !== enabled) strategies.forget(row.id);
     service.reconcile();
     const requested = new Set(ids);
     return {
       requestId: request.id,
-      data: service.listMonitors().filter(({ id }) => requested.has(id)),
+      data: listMonitors().filter(({ id }) => requested.has(id)),
     };
   });
 
@@ -303,6 +383,7 @@ export function registerMarketRoutes(
         .values(auditRow(username, 'MONITOR_DELETED', id))
         .run();
     });
+    strategies.forget(id);
     service.reconcile();
     return { requestId: request.id, data: { id } };
   });
@@ -313,5 +394,39 @@ export function registerMarketRoutes(
       requestId: request.id,
       data: { ...service.diagnostics(), timeZone },
     };
+  });
+
+  app.get('/strategies', async (request) => {
+    actor(request);
+    return {
+      requestId: request.id,
+      data: {
+        templates: MARKET_TYPES.map(strategyTemplate),
+        paramsSchema: z.toJSONSchema(strategyParametersSchema),
+      },
+    };
+  });
+
+  app.get('/signals', async (request) => {
+    actor(request);
+    const query = validated(signalQuerySchema, request.query);
+    const rows = listSignals(database, query);
+    return {
+      requestId: request.id,
+      data: {
+        items: rows.slice(0, query.limit),
+        nextOffset:
+          rows.length > query.limit ? query.offset + query.limit : null,
+      },
+    };
+  });
+
+  app.get('/signals/:id', async (request) => {
+    actor(request);
+    const { id } = validated(idParameter, request.params);
+    const data = signalDetail(database, id);
+    if (!data)
+      throw new ApiError(404, 'SIGNAL_NOT_FOUND', '找不到这条候选记录。');
+    return { requestId: request.id, data };
   });
 }

@@ -11,6 +11,10 @@
     "./markets": {
       "types": "./dist/markets.d.ts",
       "default": "./dist/markets.js"
+    },
+    "./strategies": {
+      "types": "./dist/strategies.d.ts",
+      "default": "./dist/strategies.js"
     }
   },
   "dependencies": {

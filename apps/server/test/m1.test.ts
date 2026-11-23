@@ -343,7 +343,7 @@ test('upgrades a real M0 database twice and retains its administrator and audit 
       database.$client
         .prepare('SELECT COUNT(*) AS n FROM __drizzle_migrations')
         .get(),
-    ).toMatchObject({ n: 2 });
+    ).toMatchObject({ n: 3 });
     expect(database.select().from(markets).all()).toEqual([]);
   } finally {
     rmSync(legacySql, { force: true });

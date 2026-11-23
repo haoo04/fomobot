@@ -697,14 +697,19 @@ export function createMarketData(
     await Promise.allSettled(pending);
   }
 
-  function listMonitors(): Monitor[] {
+  function listMonitors(): Omit<Monitor, 'strategy'>[] {
     return configuredMarkets(database).map(({ market: row, config }) => {
       const market = view(row);
-      const { marketId, ...settings } = config;
+      const { marketId, id, enabled, trigger, confirm, trend, extra } = config;
       const oi =
         market.marketType === 'PERP' ? latestOi(database, marketId) : null;
       return {
-        ...settings,
+        id,
+        enabled,
+        trigger,
+        confirm,
+        trend,
+        extra,
         market,
         quote:
           quoteState.get(marketId)?.quote ?? latestQuote(database, marketId),
@@ -769,12 +774,24 @@ export function createMarketData(
   }
 
   return {
+    now,
     view,
     checkPeriods,
     runSync,
     reconcile,
     tick,
     listMonitors,
+    strategyMarket(marketId: string) {
+      const market = active.get(marketId);
+      return {
+        available:
+          !!market &&
+          providers[market.exchange].socket.diagnostics.connection ===
+            'CONNECTED',
+        quote:
+          quoteState.get(marketId)?.quote ?? latestQuote(database, marketId),
+      };
+    },
     capacityExceeded(items: Array<{ market: Market; config: MonitorConfig }>) {
       return EXCHANGES.find(
         (exchange) =>

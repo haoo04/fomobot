@@ -5,6 +5,7 @@ import {
   marketIdentitySchema,
   timeframeSchema,
 } from './index.js';
+import { monitorStrategySchema, strategyPatchSchema } from './strategies.js';
 
 export { timeframeSchema } from './index.js';
 
@@ -49,7 +50,11 @@ export const monitorCreateSchema = z.strictObject({
 });
 
 export const monitorPatchSchema = z
-  .strictObject({ ...marketPeriods, enabled: z.boolean() })
+  .strictObject({
+    ...marketPeriods,
+    enabled: z.boolean(),
+    strategy: strategyPatchSchema,
+  })
   .partial()
   .refine((value) => Object.keys(value).length > 0);
 
@@ -126,6 +131,7 @@ export const monitorSchema = z.object({
   market: marketSchema,
   enabled: z.boolean(),
   ...marketPeriods,
+  strategy: monitorStrategySchema,
   periods: z.array(monitoredPeriodSchema),
   quote: marketQuoteSchema.nullable(),
   openInterest: z.object({

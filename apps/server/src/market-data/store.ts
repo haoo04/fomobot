@@ -1,11 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import type {
-  Market,
-  MarketQuote,
-  MonitorConfig,
-} from '@market-sentinel/contracts/markets';
+import type { Market, MarketQuote } from '@market-sentinel/contracts/markets';
 import type { Candle, ExchangeId, Timeframe } from '@market-sentinel/domain';
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, lte, sql } from 'drizzle-orm';
 import type { AppDatabase } from '../database.js';
 import {
   candles,
@@ -15,9 +11,10 @@ import {
   quotes,
 } from '../schema.js';
 import type { CatalogPartition, OpenInterest } from './model.js';
+import { duration } from './model.js';
 
 export type MarketRow = typeof markets.$inferSelect;
-export type MonitorRow = MonitorConfig & { id: string };
+export type MonitorRow = typeof monitorConfigs.$inferSelect;
 
 export function saveCatalog(
   db: AppDatabase,
@@ -139,12 +136,19 @@ export function readCandles(
   marketId: string,
   timeframe: Timeframe,
   limit: number,
+  throughMs?: number,
 ): Candle[] {
   return db
     .select()
     .from(candles)
     .where(
-      and(eq(candles.marketId, marketId), eq(candles.timeframe, timeframe)),
+      and(
+        eq(candles.marketId, marketId),
+        eq(candles.timeframe, timeframe),
+        throughMs === undefined
+          ? undefined
+          : lte(candles.openTimeMs, throughMs - duration[timeframe]),
+      ),
     )
     .orderBy(desc(candles.openTimeMs))
     .limit(limit)

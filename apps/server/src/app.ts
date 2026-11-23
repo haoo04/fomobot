@@ -13,6 +13,7 @@ import type { AppDatabase } from './database.js';
 import { registerMarketRoutes } from './market-data/routes.js';
 import { createMarketData, type MarketData } from './market-data/service.js';
 import { administrators } from './schema.js';
+import { createStrategyService } from './strategy/service.js';
 
 const clientErrors: Record<number, readonly [string, string]> = {
   400: ['INVALID_REQUEST', '请求格式无效。'],
@@ -93,12 +94,28 @@ export async function buildApp(
   await app.register(cookie, { secret: config.SESSION_SECRET });
   await app.register(rateLimit, { global: false });
   registerAuthRoutes(app, database, config.NODE_ENV === 'production');
+  const strategies = createStrategyService(database, marketData, () =>
+    app.log.error(
+      { code: 'STRATEGY_EVALUATION_FAILED' },
+      'Strategy evaluation failed',
+    ),
+  );
   await app.register(
     async (api) =>
-      registerMarketRoutes(api, database, marketData, config.APP_TIMEZONE),
+      registerMarketRoutes(
+        api,
+        database,
+        marketData,
+        strategies,
+        config.APP_TIMEZONE,
+      ),
     { prefix: '/api/v1' },
   );
-  app.addHook('preClose', async () => marketData.stop());
+  app.addHook('onReady', async () => strategies.start());
+  app.addHook('preClose', async () => {
+    strategies.stop();
+    await marketData.stop();
+  });
 
   app.get('/health/live', async (request) => ({
     status: 'ok',

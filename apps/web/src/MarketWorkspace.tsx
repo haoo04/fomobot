@@ -15,6 +15,7 @@ import type {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
 import { request } from './api';
+import { StrategyPanel } from './StrategyPanel';
 
 const api = '/api/v1';
 const marketsKey = ['market-data'];
@@ -593,6 +594,11 @@ export function MarketWorkspace() {
                   </div>
                 </div>
                 <MonitorDetails monitor={item} formatTime={formatTime} />
+                <StrategyPanel
+                  monitor={item}
+                  formatTime={formatTime}
+                  queryKey={marketsKey}
+                />
               </article>
             ))}
           </div>

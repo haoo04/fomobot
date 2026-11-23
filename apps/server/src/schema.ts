@@ -2,6 +2,13 @@ import { sql } from 'drizzle-orm';
 import { EXCHANGES, MARKET_TYPES, TIMEFRAMES } from '@market-sentinel/domain';
 import type { MarketCapabilities, Timeframe } from '@market-sentinel/domain';
 import type { MarketQuote } from '@market-sentinel/contracts/markets';
+import type {
+  CandidateDirection,
+  CandidateReview,
+  RiskLevels,
+  StrategyParameters,
+  StrategyTimeframes,
+} from '@market-sentinel/contracts/strategies';
 import {
   check,
   index,
@@ -100,6 +107,25 @@ export const markets = sqliteTable(
   ],
 );
 
+export const strategyConfigVersions = sqliteTable(
+  'strategy_config_versions',
+  {
+    id: text('id').primaryKey(),
+    strategyId: text('strategy_id').notNull(),
+    strategyVersion: text('strategy_version').notNull(),
+    algorithmVersion: text('algorithm_version').notNull(),
+    configHash: text('config_hash').notNull(),
+    params: text('params_json', { mode: 'json' })
+      .$type<StrategyParameters>()
+      .notNull(),
+    timeframes: text('timeframes_json', { mode: 'json' })
+      .$type<StrategyTimeframes>()
+      .notNull(),
+    createdAtMs: integer('created_at_ms').notNull(),
+  },
+  (table) => [uniqueIndex('strategy_configs_hash').on(table.configHash)],
+);
+
 export const monitorConfigs = sqliteTable(
   'monitor_configs',
   {
@@ -112,6 +138,13 @@ export const monitorConfigs = sqliteTable(
     trend: text('trend_tf', { enum: TIMEFRAMES }).notNull(),
     extra: text('extra_json', { mode: 'json' }).$type<Timeframe[]>().notNull(),
     enabled: integer('enabled', { mode: 'boolean' }).notNull(),
+    strategyEnabled: integer('strategy_enabled', { mode: 'boolean' })
+      .notNull()
+      .default(true),
+    strategyConfigVersionId: text('strategy_config_version_id').references(
+      () => strategyConfigVersions.id,
+    ),
+    strategyAfterMs: integer('strategy_after_ms').notNull().default(0),
   },
   (table) => [
     primaryKey({ columns: [table.id] }),
@@ -180,4 +213,49 @@ export const quotes = sqliteTable(
     quote: text('quote_json', { mode: 'json' }).$type<MarketQuote>().notNull(),
   },
   (table) => [primaryKey({ columns: [table.marketId] })],
+);
+
+export const signalCandidates = sqliteTable(
+  'signal_candidates',
+  {
+    id: text('id').primaryKey(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    marketId: text('market_id')
+      .notNull()
+      .references(() => markets.id),
+    configVersionId: text('strategy_config_version_id')
+      .notNull()
+      .references(() => strategyConfigVersions.id),
+    triggerTimeframe: text('trigger_tf', { enum: TIMEFRAMES }).notNull(),
+    triggerOpenMs: integer('trigger_open_ms').notNull(),
+    triggerCloseMs: integer('trigger_close_ms').notNull(),
+    direction: text('direction').$type<CandidateDirection>().notNull(),
+    evaluatedAtMs: integer('evaluated_at_ms').notNull(),
+    evidence: text('evidence_json', { mode: 'json' })
+      .$type<Record<string, unknown>>()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex('candidates_idempotency').on(table.idempotencyKey),
+    index('candidates_market_trigger').on(
+      table.marketId,
+      table.triggerTimeframe,
+      table.triggerCloseMs,
+    ),
+    index('candidates_recent').on(table.evaluatedAtMs, table.id),
+  ],
+);
+
+export const riskEvaluations = sqliteTable(
+  'risk_evaluations',
+  {
+    candidateId: text('candidate_id')
+      .notNull()
+      .references(() => signalCandidates.id),
+    stage: text('stage', { enum: ['PRE'] }).notNull(),
+    outcome: text('outcome').$type<CandidateReview['outcome']>().notNull(),
+    reasonCode: text('reason_code'),
+    levels: text('levels_json', { mode: 'json' }).$type<RiskLevels>(),
+  },
+  (table) => [primaryKey({ columns: [table.candidateId, table.stage] })],
 );
