@@ -1,6 +1,6 @@
 # Market Sentinel
 
-多交易所行情与信号监控平台。M0 提供本地管理员登录、API 与数据库状态面板，以及后续行情接入所需的共享类型和校验契约。
+多交易所行情与信号监控平台。控制台提供本地管理员登录、Bitget 与 Hyperliquid 行情目录、市场监控和采集诊断。
 
 ## Windows 本地启动
 
@@ -38,6 +38,14 @@ npm.cmd run dev
 浏览器打开 [http://localhost:5173](http://localhost:5173)。开发服务器从同一来源转发 API，Fastify 默认监听 `127.0.0.1:3001`。默认数据库为 `data/market-sentinel.sqlite`。服务启动时也会应用尚未执行的迁移。
 
 生产设置使用 `NODE_ENV=production`、HTTPS `WEB_ORIGIN` 和同源反向代理。Web 构建产物在 `apps/web/dist`，API 用 `npm.cmd start` 启动。
+
+## 市场监控
+
+- 登录后打开「市场监控」，按交易所、产品类型或符号搜索。目录在启动及每 6 小时自动同步，也可手动刷新。
+- 选择市场后配置触发、确认、方向和额外观察周期。默认使用 `3m`、`5m`、`1h`。可在列表中编辑、暂停、删除或批量启停。删除配置会保留该市场已采集的数据。
+- 每周期尝试载入 500 根已收盘 K 线，少于 300 根含有效成交量的历史会标为预热中。页面分别显示盘中价、最近收盘、K 线缺口、点差和永续 OI 样本时间。
+- Reality 的 `3m` 依赖完整的公开 REST `1m`。Bitget 日线使用 REST 的 `1Dutc`，通过该市场的 UTC 边界验证后才开放。Bitget 公共 WebSocket 最多使用 49 个频道，额外周期和行情频道共用该容量。
+- 行情采集使用两家交易所的公开 REST 和 WebSocket，需要本机能访问 `api.bitget.com`、`ws.bitget.com` 和 `api.hyperliquid.xyz`。
 
 ## 检查
 

@@ -1,52 +1,17 @@
 import {
-  apiErrorResponseSchema,
   authSessionResponseSchema,
   livenessResponseSchema,
   readinessResponseSchema,
 } from '@market-sentinel/contracts';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import type { FormEvent } from 'react';
+import { request, RequestError } from './api';
 
 const sessionQueryKey = ['session'];
-
-class RequestError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
-async function request<T>(
-  path: string,
-  parse: (body: unknown) => T,
-  options?: RequestInit,
-) {
-  let response: Response;
-  try {
-    response = await fetch(path, options);
-  } catch {
-    throw new Error('无法连接服务。');
-  }
-  const body: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    const problem = apiErrorResponseSchema.safeParse(body);
-    if (problem.success) {
-      throw new RequestError(
-        problem.data.error.code,
-        problem.data.error.message,
-      );
-    }
-    throw new Error('服务暂时无法处理请求。');
-  }
-  try {
-    return parse(body);
-  } catch {
-    throw new Error('服务响应格式无效。');
-  }
-}
+const MarketWorkspace = lazy(async () => ({
+  default: (await import('./MarketWorkspace')).MarketWorkspace,
+}));
 
 function Login() {
   const queryClient = useQueryClient();
@@ -121,6 +86,7 @@ function Login() {
 
 function Dashboard({ username }: { username: string }) {
   const queryClient = useQueryClient();
+  const [page, setPage] = useState<'overview' | 'markets'>('overview');
   const live = useQuery({
     queryKey: ['health', 'live'],
     queryFn: () => request('/health/live', livenessResponseSchema.parse),
@@ -147,6 +113,7 @@ function Dashboard({ username }: { username: string }) {
     onSuccess: async () => {
       await queryClient.cancelQueries({ queryKey: sessionQueryKey });
       queryClient.setQueryData(sessionQueryKey, null);
+      queryClient.removeQueries({ queryKey: ['market-data'] });
     },
   });
 
@@ -157,9 +124,27 @@ function Dashboard({ username }: { username: string }) {
       : '状态未知';
 
   return (
-    <main className="dashboard">
+    <main
+      className={page === 'markets' ? 'dashboard dashboard-wide' : 'dashboard'}
+    >
+      <nav className="dashboard-nav" aria-label="控制台">
+        <button
+          type="button"
+          aria-current={page === 'overview' ? 'page' : undefined}
+          onClick={() => setPage('overview')}
+        >
+          总览
+        </button>
+        <button
+          type="button"
+          aria-current={page === 'markets' ? 'page' : undefined}
+          onClick={() => setPage('markets')}
+        >
+          市场监控
+        </button>
+      </nav>
       <div className="dashboard-heading">
-        <h1>总览</h1>
+        <h1>{page === 'markets' ? '市场监控' : '总览'}</h1>
         <div className="account">
           <span>{username}</span>
           <button
@@ -176,28 +161,34 @@ function Dashboard({ username }: { username: string }) {
           {logout.error.message}
         </p>
       )}
-      <section aria-label="系统状态" className="status-grid">
-        <div className="panel status-card">
-          <h2>API 服务</h2>
-          <p role="status" data-state={live.status}>
-            {live.isPending
-              ? '正在检查'
-              : live.isSuccess
-                ? '运行中'
-                : '连接失败'}
-          </p>
-        </div>
-        <div className="panel status-card">
-          <h2>SQLite 数据库</h2>
-          <p role="status" data-state={ready.status}>
-            {ready.isPending
-              ? '正在检查'
-              : ready.isSuccess
-                ? '就绪'
-                : databaseStatus}
-          </p>
-        </div>
-      </section>
+      {page === 'markets' ? (
+        <Suspense fallback={<p role="status">正在加载市场监控…</p>}>
+          <MarketWorkspace />
+        </Suspense>
+      ) : (
+        <section aria-label="系统状态" className="status-grid">
+          <div className="panel status-card">
+            <h2>API 服务</h2>
+            <p role="status" data-state={live.status}>
+              {live.isPending
+                ? '正在检查'
+                : live.isSuccess
+                  ? '运行中'
+                  : '连接失败'}
+            </p>
+          </div>
+          <div className="panel status-card">
+            <h2>SQLite 数据库</h2>
+            <p role="status" data-state={ready.status}>
+              {ready.isPending
+                ? '正在检查'
+                : ready.isSuccess
+                  ? '就绪'
+                  : databaseStatus}
+            </p>
+          </div>
+        </section>
+      )}
     </main>
   );
 }
