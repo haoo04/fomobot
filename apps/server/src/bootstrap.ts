@@ -8,6 +8,7 @@ import {
   SetupError,
 } from './config.js';
 import { migrateDatabase, openDatabase } from './database.js';
+import { createMarketData } from './market-data/service.js';
 
 const administratorCredentialsSchema = loginRequestSchema.extend({
   password: loginRequestSchema.shape.password.min(12),
@@ -27,7 +28,9 @@ async function main() {
   try {
     migrateDatabase(database);
     if (config) {
-      const app = await buildApp(database, config);
+      const marketData = createMarketData(database);
+      const app = await buildApp(database, config, marketData);
+      app.addHook('onReady', async () => marketData.start());
       app.addHook('onClose', async () => database.$client.close());
       await app.listen({ host: config.HOST, port: config.PORT });
       listening = true;

@@ -14,7 +14,7 @@ export const marketIdentitySchema = z.strictObject({
   venue: z.string().min(1),
   nativeSymbol: z.string().min(1),
   baseAsset: z.string().min(1),
-  quoteAsset: z.string().min(1),
+  quoteAsset: z.string().min(1).nullable(),
 }) satisfies z.ZodType<MarketIdentity>;
 
 export const marketCapabilitiesSchema = z.strictObject({

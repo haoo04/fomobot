@@ -24,7 +24,7 @@ export interface MarketIdentity {
   venue: string;
   nativeSymbol: string;
   baseAsset: string;
-  quoteAsset: string;
+  quoteAsset: string | null;
 }
 
 export interface MarketCapabilities {

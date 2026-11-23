@@ -10,6 +10,8 @@ import { ApiError } from './api-error.js';
 import { registerAuthRoutes } from './auth.js';
 import type { AppConfig } from './config.js';
 import type { AppDatabase } from './database.js';
+import { registerMarketRoutes } from './market-data/routes.js';
+import { createMarketData, type MarketData } from './market-data/service.js';
 import { administrators } from './schema.js';
 
 const clientErrors: Record<number, readonly [string, string]> = {
@@ -19,7 +21,11 @@ const clientErrors: Record<number, readonly [string, string]> = {
   429: ['RATE_LIMITED', '登录尝试过于频繁，请稍后再试。'],
 };
 
-export async function buildApp(database: AppDatabase, config: AppConfig) {
+export async function buildApp(
+  database: AppDatabase,
+  config: AppConfig,
+  marketData: MarketData = createMarketData(database),
+) {
   const app = Fastify({
     bodyLimit: 8_192,
     genReqId: () => randomUUID(),
@@ -87,6 +93,12 @@ export async function buildApp(database: AppDatabase, config: AppConfig) {
   await app.register(cookie, { secret: config.SESSION_SECRET });
   await app.register(rateLimit, { global: false });
   registerAuthRoutes(app, database, config.NODE_ENV === 'production');
+  await app.register(
+    async (api) =>
+      registerMarketRoutes(api, database, marketData, config.APP_TIMEZONE),
+    { prefix: '/api/v1' },
+  );
+  app.addHook('preClose', async () => marketData.stop());
 
   app.get('/health/live', async (request) => ({
     status: 'ok',

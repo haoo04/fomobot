@@ -82,7 +82,7 @@ function hashSession(token: string) {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function requireSession(database: AppDatabase, request: FastifyRequest) {
+export function requireSession(database: AppDatabase, request: FastifyRequest) {
   const cookie = request.cookies[cookieName];
   if (cookie) {
     const signature = request.unsignCookie(cookie);
