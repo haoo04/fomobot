@@ -7,13 +7,14 @@ import {
   signalsResponseSchema,
   strategyPatchSchema,
   type StrategyPatch,
+  type SignalDetail,
 } from '@market-sentinel/contracts/strategies';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
 import { request } from './api';
 import { aiFailureLabels, deliveryLabels } from './NotificationSettings';
 
-const outcomes = {
+export const outcomes = {
   WAITING: '等待收盘',
   NO_TRADE: '条件未满足',
   PASSED: '预风控通过',
@@ -21,7 +22,11 @@ const outcomes = {
   SUPPRESSED: '已抑制',
   WATCH_ONLY: '现货观察',
 };
-const directions = { LONG: '做多', SHORT: '做空', BEARISH_WATCH: '偏空观察' };
+export const directions = {
+  LONG: '做多',
+  SHORT: '做空',
+  BEARISH_WATCH: '偏空观察',
+};
 const aiDecisions = { ACCEPT: '接受', REJECT: '拒绝', MODIFY: '修改' };
 const reasons: Record<string, string> = {
   ...aiFailureLabels,
@@ -51,6 +56,12 @@ const reasons: Record<string, string> = {
   SUPPRESS_DAILY_LIMIT: '达到当日通知上限',
   TELEGRAM_PAIRING_CHANGED: 'Telegram 配对已变更',
   EVALUATION_FAILED: '策略评估失败',
+  MARKET_UNLISTED: '市场已下架',
+  MONITOR_PAUSED: '监控已暂停',
+  MONITOR_DELETED: '监控已删除',
+  TIMEFRAME_STOPPED: '原周期已停采',
+  COLLECTION_UNAVAILABLE: '原周期当前未采集',
+  DATA_GAP: '追踪窗口行情不完整',
 };
 
 function numberField(
@@ -346,15 +357,6 @@ export function StrategyPanel({
       }),
     onSuccess: async () => client.invalidateQueries({ queryKey }),
   });
-  const resend = useMutation({
-    mutationFn: (id: string) =>
-      request('/api/v1/signals/' + id + '/resend', () => undefined, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true }),
-      }),
-    onSuccess: async () => client.invalidateQueries({ queryKey }),
-  });
   const { strategy } = monitor;
   const { maxSpreadBps, minTurnover, minStopPct, maxStopPct, maxAtrPct } =
     strategy.params.risk;
@@ -371,7 +373,6 @@ export function StrategyPanel({
   else if (latest) summary = outcomes[latest.outcome];
   else if (incomplete) summary = '阈值待配置';
   const signal = detail.data?.data;
-  const levels = signal?.finalRisk?.levels ?? signal?.levels;
 
   return (
     <details
@@ -444,172 +445,262 @@ export function StrategyPanel({
             </p>
           )}
           {selected && signal && (
-            <section className="strategy-result" aria-label="候选详情">
-              <h3>
-                {directions[signal.direction]} · {outcomes[signal.outcome]}
-              </h3>
-              <p className="market-meta">
-                {formatTime(signal.triggerCloseMs)} ·{' '}
-                {signal.timeframes.trigger} / {signal.timeframes.confirm} /{' '}
-                {signal.timeframes.trend}
-                {signal.reasonCode &&
-                  ' · ' + (reasons[signal.reasonCode] ?? signal.reasonCode)}
-              </p>
-              <p className="market-meta">配置版本 {signal.configVersionId}</p>
-              {signal.finalRisk && (
-                <p className="market-meta">
-                  最终风控 ·{' '}
-                  {signal.finalRisk.outcome === 'PASSED'
-                    ? '通过'
-                    : outcomes[signal.finalRisk.outcome]}
-                  {signal.finalRisk.reasonCode &&
-                    ' · ' +
-                      (reasons[signal.finalRisk.reasonCode] ??
-                        signal.finalRisk.reasonCode)}
-                  {signal.finalRisk.atMs !== null &&
-                    ' · ' + formatTime(signal.finalRisk.atMs)}
-                </p>
-              )}
-              {signal.signalId && (
-                <p className="market-meta">
-                  正式信号 {signal.signalId}
-                  {' · ' +
-                    (signal.signalMode === 'AI_REVIEW'
-                      ? 'AI 审核'
-                      : '规则模式')}
-                </p>
-              )}
-              {signal.deliveries.map((delivery) => (
-                <p className="market-meta" key={String(delivery.manual)}>
-                  {delivery.manual ? '补发' : 'Telegram'} ·{' '}
-                  {deliveryLabels[delivery.status]}
-                  {delivery.telegramMessageId &&
-                    ' · 消息 ID ' + delivery.telegramMessageId}
-                  {delivery.sentAtMs !== null &&
-                    ' · ' + formatTime(delivery.sentAtMs)}
-                  {delivery.lastError &&
-                    ' · ' + (reasons[delivery.lastError] ?? delivery.lastError)}
-                </p>
-              ))}
-              {signal.canResend && (
-                <button
-                  type="button"
-                  disabled={resend.isPending}
-                  onClick={() => {
-                    if (
-                      window.confirm(
-                        'Telegram 可能已送达此信号。确认补发可能重复的消息？',
-                      )
-                    )
-                      resend.mutate(signal.id);
-                  }}
-                >
-                  确认补发
-                </button>
-              )}
-              {resend.isError && resend.variables === signal.id && (
-                <p role="alert" className="error">
-                  {resend.error.message}
-                </p>
-              )}
-              {signal.aiReview && (
-                <details open>
-                  <summary>AI 审核详情</summary>
-                  <p className="market-meta">
-                    {signal.aiReview.reportedModel ?? signal.aiReview.model}
-                    {' · ' + signal.aiReview.promptVersion}
-                    {signal.aiReview.result &&
-                      ' · ' +
-                        aiDecisions[signal.aiReview.result.decision] +
-                        ' · 主观评分 ' +
-                        signal.aiReview.result.confidenceScore +
-                        '/100'}
-                    {signal.aiReview.reasonCode &&
-                      ' · ' +
-                        (reasons[signal.aiReview.reasonCode] ??
-                          signal.aiReview.reasonCode)}
-                  </p>
-                  {signal.aiReview.result?.rejectReason && (
-                    <p>{signal.aiReview.result.rejectReason}</p>
-                  )}
-                  {signal.aiReview.result?.rationale.map((reason, index) => (
-                    <p key={index}>{reason}</p>
-                  ))}
-                  {!!signal.aiReview.result?.riskFlags.length && (
-                    <p className="market-meta">
-                      风险 {signal.aiReview.result.riskFlags.join(' · ')}
-                    </p>
-                  )}
-                  {signal.aiReview.inputTokens !== null && (
-                    <p className="market-meta">
-                      输入 {signal.aiReview.inputTokens} / 输出{' '}
-                      {signal.aiReview.outputTokens} tokens · 估算 USD{' '}
-                      {signal.aiReview.costUsd?.toFixed(6)}
-                    </p>
-                  )}
-                  <details>
-                    <summary>审核请求与结果</summary>
-                    <pre>
-                      {JSON.stringify(
-                        {
-                          request: signal.aiReview.requestSummary,
-                          result: signal.aiReview.result,
-                        },
-                        null,
-                        2,
-                      )}
-                    </pre>
-                  </details>
-                </details>
-              )}
-              {levels && (
-                <dl className="market-facts">
-                  <div>
-                    <dt>参考入场</dt>
-                    <dd>{levels.entry}</dd>
-                  </div>
-                  <div>
-                    <dt>止损</dt>
-                    <dd>{levels.stop}</dd>
-                  </div>
-                  {levels.takeProfits.map((target, i) => (
-                    <div key={target.price}>
-                      <dt>
-                        TP{i + 1}（{target.closePct}%）
-                      </dt>
-                      <dd>{target.price}</dd>
-                      {target.trailPolicy === 'BREAKEVEN_AFTER_TP1' && (
-                        <dd>TP1 后移至保本</dd>
-                      )}
-                      {target.trailPolicy === 'ATR_TRAIL_AFTER_TP1' && (
-                        <dd>TP1 后按触发周期 1.5×ATR 移动止损</dd>
-                      )}
-                    </div>
-                  ))}
-                  <div>
-                    <dt>加权 R:R</dt>
-                    <dd>{levels.weightedRR}</dd>
-                  </div>
-                </dl>
-              )}
-              <details>
-                <summary>计算证据与参数快照</summary>
-                <pre>
-                  {JSON.stringify(
-                    {
-                      ...signal.evidence,
-                      params: signal.params,
-                      finalQuote: signal.finalRisk?.quote,
-                    },
-                    null,
-                    2,
-                  )}
-                </pre>
-              </details>
-            </section>
+            <SignalAudit
+              signal={signal}
+              formatTime={formatTime}
+              queryKey={queryKey}
+            />
           )}
         </>
       )}
     </details>
+  );
+}
+
+export const theoryLabels = {
+  ACTIVE: '追踪中',
+  TP1_HIT: '触及 TP1',
+  TP2_HIT: '触及 TP2',
+  TP3_HIT: '触及 TP3',
+  TP4_HIT: '触及 TP4',
+  SL_HIT: '触及止损',
+  EXPIRED: '已到期',
+  INVALIDATED: '已失效',
+};
+
+export function SignalAudit({
+  signal,
+  formatTime,
+  queryKey,
+}: {
+  signal: SignalDetail;
+  formatTime(value: number | null): string;
+  queryKey: readonly string[];
+}) {
+  const client = useQueryClient();
+  const resend = useMutation({
+    mutationFn: (id: string) =>
+      request('/api/v1/signals/' + id + '/resend', () => undefined, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      }),
+    onSuccess: async () => client.invalidateQueries({ queryKey }),
+  });
+  const levels = signal.finalRisk?.levels ?? signal.levels;
+  return (
+    <section className="strategy-result" aria-label="候选详情">
+      <h3>
+        {directions[signal.direction]} · {outcomes[signal.outcome]}
+      </h3>
+      <p className="market-meta">
+        {formatTime(signal.triggerCloseMs)} · {signal.timeframes.trigger} /{' '}
+        {signal.timeframes.confirm} / {signal.timeframes.trend}
+        {signal.reasonCode &&
+          ' · ' + (reasons[signal.reasonCode] ?? signal.reasonCode)}
+      </p>
+      <p className="market-meta">配置版本 {signal.configVersionId}</p>
+      {signal.finalRisk && (
+        <p className="market-meta">
+          最终风控 ·{' '}
+          {signal.finalRisk.outcome === 'PASSED'
+            ? '通过'
+            : outcomes[signal.finalRisk.outcome]}
+          {signal.finalRisk.reasonCode &&
+            ' · ' +
+              (reasons[signal.finalRisk.reasonCode] ??
+                signal.finalRisk.reasonCode)}
+          {signal.finalRisk.atMs !== null &&
+            ' · ' + formatTime(signal.finalRisk.atMs)}
+        </p>
+      )}
+      {signal.signalId && (
+        <p className="market-meta">
+          正式信号 {signal.signalId}
+          {' · ' + (signal.signalMode === 'AI_REVIEW' ? 'AI 审核' : '规则模式')}
+        </p>
+      )}
+      {[...signal.deliveries, ...signal.updates].map((delivery) => (
+        <details key={delivery.id}>
+          <summary>
+            {signal.updates.includes(delivery)
+              ? '信号更新'
+              : delivery.manual
+                ? '补发'
+                : 'Telegram'}{' '}
+            · {deliveryLabels[delivery.status]}
+            {delivery.telegramMessageId &&
+              ' · 消息 ID ' + delivery.telegramMessageId}
+            {delivery.sentAtMs !== null &&
+              ' · ' + formatTime(delivery.sentAtMs)}
+            {delivery.lastError &&
+              ' · ' + (reasons[delivery.lastError] ?? delivery.lastError)}
+          </summary>
+          <pre>{delivery.body}</pre>
+        </details>
+      ))}
+      {signal.canResend && (
+        <button
+          type="button"
+          disabled={resend.isPending}
+          onClick={() => {
+            if (
+              window.confirm(
+                'Telegram 可能已送达此信号。确认补发可能重复的消息？',
+              )
+            )
+              resend.mutate(signal.id);
+          }}
+        >
+          确认补发
+        </button>
+      )}
+      {resend.isError && resend.variables === signal.id && (
+        <p role="alert" className="error">
+          {resend.error.message}
+        </p>
+      )}
+      {signal.aiReview && (
+        <details open>
+          <summary>AI 审核详情</summary>
+          <p className="market-meta">
+            {signal.aiReview.reportedModel ?? signal.aiReview.model}
+            {' · ' + signal.aiReview.promptVersion}
+            {signal.aiReview.result &&
+              ' · ' +
+                aiDecisions[signal.aiReview.result.decision] +
+                ' · 主观评分 ' +
+                signal.aiReview.result.confidenceScore +
+                '/100'}
+            {signal.aiReview.reasonCode &&
+              ' · ' +
+                (reasons[signal.aiReview.reasonCode] ??
+                  signal.aiReview.reasonCode)}
+          </p>
+          {signal.aiReview.result?.rejectReason && (
+            <p>{signal.aiReview.result.rejectReason}</p>
+          )}
+          {signal.aiReview.result?.rationale.map((reason, index) => (
+            <p key={index}>{reason}</p>
+          ))}
+          {!!signal.aiReview.result?.riskFlags.length && (
+            <p className="market-meta">
+              风险 {signal.aiReview.result.riskFlags.join(' · ')}
+            </p>
+          )}
+          {signal.aiReview.inputTokens !== null && (
+            <p className="market-meta">
+              输入 {signal.aiReview.inputTokens} / 输出{' '}
+              {signal.aiReview.outputTokens} tokens · 估算 USD{' '}
+              {signal.aiReview.costUsd?.toFixed(6)}
+            </p>
+          )}
+          <details>
+            <summary>审核请求与结果</summary>
+            <pre>
+              {JSON.stringify(
+                {
+                  request: signal.aiReview.requestSummary,
+                  result: signal.aiReview.result,
+                },
+                null,
+                2,
+              )}
+            </pre>
+          </details>
+        </details>
+      )}
+      {levels && (
+        <dl className="market-facts">
+          <div>
+            <dt>参考入场</dt>
+            <dd>{levels.entry}</dd>
+          </div>
+          <div>
+            <dt>止损</dt>
+            <dd>{levels.stop}</dd>
+          </div>
+          {levels.takeProfits.map((target, i) => (
+            <div key={target.price}>
+              <dt>
+                TP{i + 1}（{target.closePct}%）
+              </dt>
+              <dd>{target.price}</dd>
+              {target.trailPolicy === 'BREAKEVEN_AFTER_TP1' && (
+                <dd>TP1 后移至保本</dd>
+              )}
+              {target.trailPolicy === 'ATR_TRAIL_AFTER_TP1' && (
+                <dd>TP1 后按触发周期 1.5×ATR 移动止损</dd>
+              )}
+            </div>
+          ))}
+          <div>
+            <dt>加权 R:R</dt>
+            <dd>{levels.weightedRR}</dd>
+          </div>
+        </dl>
+      )}
+      {signal.theory && (
+        <details open>
+          <summary>理论表现 · {theoryLabels[signal.theory.state]}</summary>
+          <p className="market-meta">
+            {formatTime(signal.theory.startAtMs)} 至{' '}
+            {formatTime(signal.theory.deadlineAtMs)}
+            {' · 已处理 ' + signal.theory.observedBars + ' 根收盘 K 线'}
+            {signal.theory.waitingForData && ' · 行情待回补'}
+            {signal.theory.reasonCode &&
+              ' · ' +
+                (reasons[signal.theory.reasonCode] ?? signal.theory.reasonCode)}
+            {signal.theory.grossR !== null &&
+              ' · 成本前理论 ' + signal.theory.grossR + ' R'}
+          </p>
+          <ul className="history-events">
+            {signal.theoryEvents
+              .filter(({ type }) => type !== 'CANDLE')
+              .map((event) => (
+                <li key={event.id}>
+                  {formatTime(event.atMs)} ·{' '}
+                  {event.type === 'TP'
+                    ? '触及 TP' + event.target
+                    : event.type === 'SL'
+                      ? '触及止损'
+                      : event.type === 'STOP_MOVED'
+                        ? '调整 TP' + event.target + ' 对应止损'
+                        : event.type === 'EXPIRED'
+                          ? '到期'
+                          : '失效'}
+                  {event.price && ' · ' + event.price}
+                  {event.closePct !== null && ' · ' + event.closePct + '%'}
+                  {event.ambiguousIntrabar && ' · 同根触及，止损优先'}
+                </li>
+              ))}
+          </ul>
+          <details>
+            <summary>已判定 K 线</summary>
+            <pre>
+              {JSON.stringify(
+                signal.theoryEvents.flatMap(({ candle }) => candle ?? []),
+                null,
+                2,
+              )}
+            </pre>
+          </details>
+        </details>
+      )}
+      <details>
+        <summary>计算证据与参数快照</summary>
+        <pre>
+          {JSON.stringify(
+            {
+              ...signal.evidence,
+              params: signal.params,
+              finalQuote: signal.finalRisk?.quote,
+            },
+            null,
+            2,
+          )}
+        </pre>
+      </details>
+    </section>
   );
 }

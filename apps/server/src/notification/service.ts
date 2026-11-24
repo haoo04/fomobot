@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { RiskLevels } from '@market-sentinel/contracts/strategies';
-import { and, count, desc, eq, gt, inArray, lte, or } from 'drizzle-orm';
+import { and, count, desc, eq, gt, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { ApiError } from '../api-error.js';
 import type { AppConfig } from '../config.js';
@@ -19,6 +19,7 @@ import {
 } from '../schema.js';
 import { evaluateRisk, reject, type RiskResult } from '../strategy/evaluate.js';
 import { signalDetail } from '../strategy/store.js';
+import { initializeOutcome, type SignalUpdate } from '../strategy/tracker.js';
 import { createAiReview, type ReviewProvider } from './ai.js';
 import { createTelegram } from './telegram.js';
 
@@ -26,6 +27,7 @@ type Candidate = NonNullable<ReturnType<typeof signalDetail>>;
 type Outbox = typeof outboxMessages.$inferSelect;
 type MarketSource = Pick<MarketData, 'now' | 'view' | 'strategyMarket'>;
 const countedDeliveries = ['SENDING', 'SENT', 'DELIVERY_UNKNOWN'] as const;
+const updateTtlMs = 5 * 60_000;
 const closedBarSummary = z.object({
   open: price.optional(),
   close: price,
@@ -100,6 +102,7 @@ function coolingDown(
         eq(signalCandidates.marketId, candidate.marketId),
         eq(signalCandidates.direction, candidate.direction),
         eq(strategyConfigVersions.strategyId, candidate.strategyId),
+        eq(outboxMessages.kind, 'TRADE_SIGNAL'),
         gt(
           signalCandidates.triggerCloseMs,
           candidate.triggerCloseMs - cooldown,
@@ -423,6 +426,14 @@ export function createNotifications(
           aiRevision: review?.settingsRevision ?? null,
         })
         .run();
+      initializeOutcome(
+        tx,
+        id,
+        candidate.triggerTimeframe,
+        atMs,
+        risk.levels,
+        candidate.evidence,
+      );
       tx.insert(outboxMessages)
         .values({
           id: randomUUID(),
@@ -439,6 +450,60 @@ export function createNotifications(
     });
   }
 
+  function originalWasSent(
+    store: Pick<AppDatabase, 'select'>,
+    signalId: string,
+    pairing: { id: string; chatId: string },
+  ) {
+    return !!store
+      .select({ id: outboxMessages.id })
+      .from(outboxMessages)
+      .where(
+        and(
+          eq(outboxMessages.signalId, signalId),
+          eq(outboxMessages.kind, 'TRADE_SIGNAL'),
+          eq(outboxMessages.status, 'SENT'),
+          eq(outboxMessages.pairingId, pairing.id),
+          eq(outboxMessages.chatId, pairing.chatId),
+        ),
+      )
+      .get();
+  }
+
+  const enqueueUpdate: SignalUpdate = (store, update) => {
+    const atMs = now();
+    const expiresAtMs = update.atMs + updateTtlMs;
+    if (atMs >= expiresAtMs || lifecycle.signal.aborted) return;
+    const { pairing, signalUpdatesEnabled } = telegram.current();
+    if (
+      !pairing ||
+      !signalUpdatesEnabled ||
+      !originalWasSent(store, update.signalId, pairing)
+    )
+      return;
+    store
+      .insert(outboxMessages)
+      .values({
+        id: randomUUID(),
+        dedupeKey: `update:${update.signalId}:${update.atMs}`,
+        kind: 'SIGNAL_UPDATE',
+        signalId: update.signalId,
+        pairingId: pairing.id,
+        chatId: pairing.chatId,
+        body: [
+          '[理论信号更新] ' + update.exchange + ' · ' + update.symbol,
+          displayTime.format(update.atMs),
+          ...update.lines,
+          '信号 ID ' + update.signalId,
+        ].join('\n'),
+        createdAtMs: atMs,
+        nextAttemptMs: atMs,
+        expiresAtMs,
+      })
+      .onConflictDoNothing()
+      .run();
+  };
+
   async function tickOutbox() {
     if (lifecycle.signal.aborted) return;
     if (recoverOutbox) {
@@ -452,7 +517,12 @@ export function createNotifications(
       recoverOutbox = false;
     }
     const atMs = now();
-    const { pairing, marketDailyLimit, globalDailyLimit } = telegram.current();
+    const {
+      pairing,
+      marketDailyLimit,
+      globalDailyLimit,
+      signalUpdatesEnabled,
+    } = telegram.current();
     const item = db.transaction((tx) => {
       const pending = tx
         .select()
@@ -463,7 +533,11 @@ export function createNotifications(
             lte(outboxMessages.nextAttemptMs, atMs),
           ),
         )
-        .orderBy(outboxMessages.nextAttemptMs, outboxMessages.createdAtMs)
+        .orderBy(
+          sql`case when ${outboxMessages.kind} = 'TRADE_SIGNAL' then 0 else 1 end`,
+          outboxMessages.nextAttemptMs,
+          outboxMessages.createdAtMs,
+        )
         .get();
       if (!pending) return undefined;
       let reason: string | null = null;
@@ -496,12 +570,18 @@ export function createNotifications(
           .where(eq(signals.id, pending.signalId))
           .get()!;
         const candidate = signalDetail(db, signal.candidateId)!;
-        const currentAi = ai.current();
-        reason =
-          currentAi.enabled !== (signal.mode === 'AI_REVIEW') ||
-          (signal.aiRevision && currentAi.revision !== signal.aiRevision)
-            ? 'SUPPRESS_AI_SETTINGS_CHANGED'
-            : check(candidate, signal.levels, atMs).risk.reasonCode;
+        if (pending.kind === 'SIGNAL_UPDATE') {
+          if (!signalUpdatesEnabled) reason = 'SIGNAL_UPDATES_DISABLED';
+          else if (!pairing || !originalWasSent(tx, pending.signalId, pairing))
+            reason = 'ORIGINAL_DELIVERY_UNAVAILABLE';
+        } else {
+          const currentAi = ai.current();
+          reason =
+            currentAi.enabled !== (signal.mode === 'AI_REVIEW') ||
+            (signal.aiRevision && currentAi.revision !== signal.aiRevision)
+              ? 'SUPPRESS_AI_SETTINGS_CHANGED'
+              : check(candidate, signal.levels, atMs).risk.reasonCode;
+        }
         if (!reason) {
           const counts = tx
             .select({ marketId: signalCandidates.marketId, total: count() })
@@ -514,6 +594,7 @@ export function createNotifications(
             .where(
               and(
                 eq(outboxMessages.sendDay, day.format(atMs)),
+                eq(outboxMessages.kind, pending.kind),
                 inArray(outboxMessages.status, countedDeliveries),
               ),
             )
@@ -606,6 +687,7 @@ export function createNotifications(
         .values({
           id,
           dedupeKey: 'test:' + id,
+          kind: 'TELEGRAM_TEST',
           pairingId: pairing.id,
           chatId: pairing.chatId,
           body: 'Market Sentinel Telegram 测试消息',
@@ -633,7 +715,12 @@ export function createNotifications(
     const rows = db
       .select()
       .from(outboxMessages)
-      .where(eq(outboxMessages.signalId, signalId))
+      .where(
+        and(
+          eq(outboxMessages.signalId, signalId),
+          eq(outboxMessages.kind, 'TRADE_SIGNAL'),
+        ),
+      )
       .all();
     if (rows.length !== 1) return;
     const [item] = rows;
@@ -766,6 +853,7 @@ export function createNotifications(
     ai,
     testAi,
     enqueueTest,
+    enqueueUpdate,
     resend,
     diagnostics,
     tickSignals,

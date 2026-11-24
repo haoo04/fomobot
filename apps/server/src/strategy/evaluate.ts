@@ -241,7 +241,13 @@ export function oiChange(
   };
 }
 
-export function roundPrice(market: Market, value: Decimal): Decimal | null {
+export function roundPrice(
+  market: Pick<
+    Market,
+    'pricePrecision' | 'tickSize' | 'marketType' | 'exchange'
+  >,
+  value: Decimal,
+): Decimal | null {
   const { pricePrecision, tickSize } = market;
   if (
     pricePrecision === null ||

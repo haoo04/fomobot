@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { TelegramSettingsPatch } from '@market-sentinel/contracts/notifications';
-import { and, desc, eq, isNull } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { ApiError } from '../api-error.js';
 import type { AppConfig } from '../config.js';
@@ -144,19 +144,27 @@ export function createTelegram(
       pairing,
       marketDailyLimit: row?.marketDailyLimit ?? 8,
       globalDailyLimit: row?.globalDailyLimit ?? 30,
+      signalUpdatesEnabled: row?.signalUpdatesEnabled ?? true,
     };
   }
 
   function settings() {
-    const { row, token, binding, pairing, marketDailyLimit, globalDailyLimit } =
-      current();
+    const {
+      row,
+      token,
+      binding,
+      pairing,
+      marketDailyLimit,
+      globalDailyLimit,
+      signalUpdatesEnabled,
+    } = current();
     const lastTest = pairing
       ? (db
           .select(deliveryFields)
           .from(outboxMessages)
           .where(
             and(
-              isNull(outboxMessages.signalId),
+              eq(outboxMessages.kind, 'TELEGRAM_TEST'),
               eq(outboxMessages.pairingId, pairing.id),
             ),
           )
@@ -175,6 +183,7 @@ export function createTelegram(
       pairingError: binding?.pairingError ?? null,
       marketDailyLimit,
       globalDailyLimit,
+      signalUpdatesEnabled,
       lastTest,
     };
   }
@@ -197,6 +206,8 @@ export function createTelegram(
         tokenRef,
         marketDailyLimit: patch.marketDailyLimit,
         globalDailyLimit: patch.globalDailyLimit,
+        signalUpdatesEnabled:
+          patch.signalUpdatesEnabled ?? row?.signalUpdatesEnabled ?? true,
         ...(newFingerprint === fingerprint
           ? {}
           : {

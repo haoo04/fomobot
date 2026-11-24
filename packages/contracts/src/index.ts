@@ -5,6 +5,24 @@ import type {
 } from '@market-sentinel/domain';
 import { z } from 'zod';
 
+export function startOfCalendarDay(day: string, timeZone: string) {
+  const utc = Date.parse(day + 'T00:00:00.000Z');
+  const format = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  let lo = utc - 36 * 60 * 60_000;
+  let hi = utc + 36 * 60 * 60_000;
+  while (lo < hi) {
+    const at = Math.floor((lo + hi) / 2);
+    if (format.format(at) < day) lo = at + 1;
+    else hi = at;
+  }
+  return lo;
+}
+
 export const timeframeSchema = z.enum(TIMEFRAMES);
 
 export const marketIdentitySchema = z.strictObject({

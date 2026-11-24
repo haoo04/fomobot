@@ -2,19 +2,36 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { AiReviewResult } from '@market-sentinel/contracts/notifications';
 import type {
   CandidateDirection,
+  SignalFilters,
   SignalQuery,
   StrategyParameters,
   StrategyTimeframes,
 } from '@market-sentinel/contracts/strategies';
 import type { Candle, MarketType } from '@market-sentinel/domain';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
-import { alias } from 'drizzle-orm/sqlite-core';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  lt,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
+import { alias, type SelectedFields } from 'drizzle-orm/sqlite-core';
+import { ApiError } from '../api-error.js';
 import type { AppDatabase } from '../database.js';
 import {
   aiReviews,
+  auditLogs,
+  markets,
   riskEvaluations,
   outboxMessages,
   signalCandidates,
+  signalEvents,
+  signalOutcomes,
   signals,
   strategyConfigVersions,
 } from '../schema.js';
@@ -125,9 +142,19 @@ const finalFields = {
   outcome: finalRisk.outcome,
   reasonCode: finalRisk.reasonCode,
 };
+const tradeDelivery = alias(outboxMessages, 'trade_delivery');
+const aiDecision = sql<
+  AiReviewResult['decision'] | null
+>`json_extract(${aiReviews.result}, '$.decision')`;
 const fields = {
   id: signalCandidates.id,
   marketId: signalCandidates.marketId,
+  market: {
+    marketType: markets.marketType,
+    productType: markets.productType,
+    venue: markets.venue,
+    nativeSymbol: markets.nativeSymbol,
+  },
   configVersionId: signalCandidates.configVersionId,
   strategyId: strategyConfigVersions.strategyId,
   strategyVersion: strategyConfigVersions.strategyVersion,
@@ -142,25 +169,76 @@ const fields = {
   deliveryPending: signalCandidates.deliveryPending,
   signalId: signals.id,
   signalMode: signals.mode,
-  aiDecision: sql<
-    AiReviewResult['decision'] | null
-  >`json_extract(${aiReviews.result}, '$.decision')`.as('ai_decision'),
+  aiDecision: aiDecision.as('ai_decision'),
   aiStatus: aiReviews.status,
+  theory: {
+    state: signalOutcomes.state,
+    startAtMs: signalOutcomes.startAtMs,
+    deadlineAtMs: signalOutcomes.deadlineAtMs,
+    finishedAtMs: signalOutcomes.finishedAtMs,
+    observedBars: signalOutcomes.observedBars,
+    waitingForData: signalOutcomes.waitingForData,
+    grossR: signalOutcomes.grossR,
+    reasonCode: signalOutcomes.reasonCode,
+  },
+  delivery: {
+    status: tradeDelivery.status,
+    attempts: tradeDelivery.attempts,
+    manual: tradeDelivery.manual,
+    sentAtMs: tradeDelivery.sentAtMs,
+    telegramMessageId: tradeDelivery.telegramMessageId,
+    lastError: tradeDelivery.lastError,
+  },
+};
+const details = {
+  ...fields,
+  params: strategyConfigVersions.params,
+  timeframes: strategyConfigVersions.timeframes,
+  configHash: strategyConfigVersions.configHash,
+  levels: riskEvaluations.levels,
+  evidence: signalCandidates.evidence,
+  approvedAtMs: signals.approvedAtMs,
+  deliveryExpiresAtMs: signals.expiresAtMs,
+  finalRisk: {
+    ...finalFields,
+    levels: finalRisk.levels,
+    atMs: finalRisk.atMs,
+    quote: finalRisk.quote,
+  },
 };
 
-function deliveriesFor(db: AppDatabase, ids: string[]) {
-  return db
-    .select({ ...deliveryFields, signalId: outboxMessages.signalId })
-    .from(outboxMessages)
-    .where(inArray(outboxMessages.signalId, ids))
-    .orderBy(desc(outboxMessages.manual))
-    .all();
-}
+type HistoryStore = Pick<AppDatabase, 'select'>;
+const historyOrder = [
+  desc(signalCandidates.evaluatedAtMs),
+  desc(signalCandidates.id),
+] as const;
 
-export function listSignals(db: AppDatabase, query: SignalQuery) {
-  const rows = db
-    .select({ ...fields, finalRisk: finalFields })
+function historyQuery<T extends SelectedFields>(
+  db: HistoryStore,
+  projection: T,
+  query: SignalFilters,
+  condition?: SQL,
+) {
+  const latest = db
+    .select({ id: outboxMessages.id })
+    .from(outboxMessages)
+    .where(
+      and(
+        eq(outboxMessages.signalId, signals.id),
+        eq(outboxMessages.kind, 'TRADE_SIGNAL'),
+      ),
+    )
+    .orderBy(
+      desc(outboxMessages.manual),
+      desc(outboxMessages.createdAtMs),
+      desc(outboxMessages.id),
+    )
+    .limit(1);
+  const search = query.q?.toLowerCase();
+  return db
+    .select({ ...projection, exchange: markets.exchange })
     .from(signalCandidates)
+    .innerJoin(markets, eq(markets.id, signalCandidates.marketId))
     .innerJoin(
       strategyConfigVersions,
       eq(strategyConfigVersions.id, signalCandidates.configVersionId),
@@ -180,83 +258,350 @@ export function listSignals(db: AppDatabase, query: SignalQuery) {
       ),
     )
     .leftJoin(signals, eq(signals.candidateId, signalCandidates.id))
+    .leftJoin(signalOutcomes, eq(signalOutcomes.signalId, signals.id))
     .leftJoin(aiReviews, eq(aiReviews.candidateId, signalCandidates.id))
+    .leftJoin(tradeDelivery, eq(tradeDelivery.id, sql`(${latest})`))
     .where(
       and(
+        condition,
         query.marketId
           ? eq(signalCandidates.marketId, query.marketId)
           : undefined,
         query.state ? eq(riskEvaluations.outcome, query.state) : undefined,
+        query.finalState ? eq(finalRisk.outcome, query.finalState) : undefined,
+        query.exchange ? eq(markets.exchange, query.exchange) : undefined,
+        query.strategyId
+          ? eq(strategyConfigVersions.strategyId, query.strategyId)
+          : undefined,
+        query.deliveryState
+          ? eq(tradeDelivery.status, query.deliveryState)
+          : undefined,
+        query.theoryState
+          ? eq(signalOutcomes.state, query.theoryState)
+          : undefined,
+        query.fromMs === undefined
+          ? undefined
+          : gte(signalCandidates.triggerCloseMs, query.fromMs),
+        query.toMs === undefined
+          ? undefined
+          : lt(signalCandidates.triggerCloseMs, query.toMs),
+        search
+          ? or(
+              ...[
+                markets.nativeSymbol,
+                markets.id,
+                signalCandidates.id,
+                signals.id,
+              ].map((field) => sql`instr(lower(${field}), ${search}) > 0`),
+            )
+          : undefined,
       ),
-    )
-    .orderBy(desc(signalCandidates.evaluatedAtMs), desc(signalCandidates.id))
+    );
+}
+
+export function listSignals(db: HistoryStore, query: SignalQuery) {
+  return historyQuery(db, { ...fields, finalRisk: finalFields }, query)
+    .orderBy(...historyOrder)
     .limit(query.limit + 1)
     .offset(query.offset)
     .all();
-  const deliveries = deliveriesFor(
-    db,
-    rows.flatMap((row) => row.signalId ?? []),
-  );
-  return rows.map((row) => ({
-    ...row,
-    delivery: deliveries.find((item) => item.signalId === row.signalId) ?? null,
-  }));
 }
 
-export function signalDetail(db: AppDatabase, id: string) {
-  const row = db
+function detailRows(
+  db: HistoryStore,
+  filters: SignalFilters,
+  limit: number,
+  condition?: SQL,
+) {
+  return historyQuery(db, details, filters, condition)
+    .orderBy(...historyOrder)
+    .limit(limit)
+    .all();
+}
+
+function expandDetails(db: HistoryStore, rows: ReturnType<typeof detailRows>) {
+  if (!rows.length) return [];
+  const ids = rows.map(({ id }) => id);
+  const signalIds = rows.flatMap(({ signalId }) => signalId ?? []);
+  const deliveryRows = db
     .select({
-      ...fields,
-      params: strategyConfigVersions.params,
-      timeframes: strategyConfigVersions.timeframes,
-      configHash: strategyConfigVersions.configHash,
-      levels: riskEvaluations.levels,
-      evidence: signalCandidates.evidence,
-      finalRisk: {
-        ...finalFields,
-        levels: finalRisk.levels,
-        atMs: finalRisk.atMs,
-        quote: finalRisk.quote,
+      delivery: {
+        ...deliveryFields,
+        id: outboxMessages.id,
+        body: outboxMessages.body,
+        createdAtMs: outboxMessages.createdAtMs,
+      },
+      nextAttemptMs: outboxMessages.nextAttemptMs,
+      signalId: outboxMessages.signalId,
+      kind: outboxMessages.kind,
+    })
+    .from(outboxMessages)
+    .where(inArray(outboxMessages.signalId, signalIds))
+    .orderBy(
+      desc(outboxMessages.manual),
+      desc(outboxMessages.createdAtMs),
+      desc(outboxMessages.id),
+    )
+    .all();
+  const deliveries = new Map<string | null, typeof deliveryRows>();
+  for (const item of deliveryRows) {
+    if (!deliveries.has(item.signalId)) deliveries.set(item.signalId, []);
+    deliveries.get(item.signalId)!.push(item);
+  }
+  const eventRows = db
+    .select({
+      signalId: signalEvents.signalId,
+      event: {
+        id: signalEvents.id,
+        type: signalEvents.type,
+        atMs: signalEvents.atMs,
+        target: signalEvents.target,
+        price: signalEvents.price,
+        closePct: signalEvents.closePct,
+        ambiguousIntrabar: signalEvents.ambiguousIntrabar,
+        reasonCode: signalEvents.reasonCode,
+        candle: signalEvents.candle,
       },
     })
-    .from(signalCandidates)
-    .innerJoin(
-      strategyConfigVersions,
-      eq(strategyConfigVersions.id, signalCandidates.configVersionId),
-    )
-    .innerJoin(
-      riskEvaluations,
-      and(
-        eq(riskEvaluations.candidateId, signalCandidates.id),
-        eq(riskEvaluations.stage, 'PRE'),
+    .from(signalEvents)
+    .where(inArray(signalEvents.signalId, signalIds))
+    .orderBy(asc(signalEvents.atMs), asc(signalEvents.id))
+    .all();
+  const events = new Map<string, typeof eventRows>();
+  for (const item of eventRows) {
+    if (!events.has(item.signalId)) events.set(item.signalId, []);
+    events.get(item.signalId)!.push(item);
+  }
+  const reviews = new Map(
+    db
+      .select()
+      .from(aiReviews)
+      .where(inArray(aiReviews.candidateId, ids))
+      .all()
+      .map((review) => [review.candidateId, review]),
+  );
+  return rows.map((row) => {
+    const audit = deliveries.get(row.signalId) ?? [];
+    const review = reviews.get(row.id);
+    const deliveryAudit = (kind: 'TRADE_SIGNAL' | 'SIGNAL_UPDATE') =>
+      audit
+        .filter((delivery) => delivery.kind === kind)
+        .map(({ delivery }) => delivery);
+    return {
+      data: {
+        ...row,
+        deliveries: deliveryAudit('TRADE_SIGNAL'),
+        updates: deliveryAudit('SIGNAL_UPDATE'),
+        theoryEvents: (row.signalId
+          ? (events.get(row.signalId) ?? [])
+          : []
+        ).map(({ event }) => event),
+        aiReview: review
+          ? { ...aiAudit(review), requestSummary: review.requestSummary }
+          : null,
+      },
+      lastActivityMs: audit.reduce(
+        (last, item) =>
+          Math.max(
+            last,
+            item.delivery.createdAtMs,
+            item.delivery.sentAtMs ?? 0,
+            item.nextAttemptMs,
+          ),
+        Math.max(
+          row.evaluatedAtMs,
+          row.approvedAtMs ?? 0,
+          row.finalRisk?.atMs ?? 0,
+          row.theory?.finishedAtMs ?? 0,
+          review?.createdAtMs ?? 0,
+          review?.completedAtMs ?? 0,
+        ),
       ),
+    };
+  });
+}
+
+export function signalDetail(db: HistoryStore, id: string) {
+  const result = expandDetails(
+    db,
+    detailRows(db, {}, 1, eq(signalCandidates.id, id)),
+  )[0];
+  return result
+    ? { ...result.data, lastActivityMs: result.lastActivityMs }
+    : undefined;
+}
+
+export function canDeleteHistory(
+  row: NonNullable<ReturnType<typeof signalDetail>>,
+  atMs: number,
+) {
+  return (
+    atMs - row.lastActivityMs >= 48 * 60 * 60_000 &&
+    !row.deliveryPending &&
+    row.aiStatus !== 'RUNNING' &&
+    (!row.signalId || row.theory?.finishedAtMs != null) &&
+    [...row.deliveries, ...row.updates].every(
+      ({ status }) => status !== 'PENDING' && status !== 'SENDING',
     )
-    .leftJoin(
-      finalRisk,
-      and(
-        eq(finalRisk.candidateId, signalCandidates.id),
-        eq(finalRisk.stage, 'FINAL'),
-      ),
-    )
-    .leftJoin(signals, eq(signals.candidateId, signalCandidates.id))
-    .leftJoin(aiReviews, eq(aiReviews.candidateId, signalCandidates.id))
-    .where(eq(signalCandidates.id, id))
-    .get();
-  if (!row) return undefined;
-  const deliveries = row.signalId ? deliveriesFor(db, [row.signalId]) : [];
-  const review = db
-    .select()
-    .from(aiReviews)
-    .where(eq(aiReviews.candidateId, id))
-    .get();
-  return {
-    ...row,
-    delivery: deliveries[0] ?? null,
-    deliveries,
-    aiReview: review
-      ? { ...aiAudit(review), requestSummary: review.requestSummary }
-      : null,
+  );
+}
+
+export function deleteSignalHistory(
+  db: AppDatabase,
+  id: string,
+  atMs: number,
+  actor: string,
+) {
+  db.transaction((tx) => {
+    const row = signalDetail(tx, id);
+    if (!row)
+      throw new ApiError(404, 'SIGNAL_NOT_FOUND', '找不到这条候选记录。');
+    if (!canDeleteHistory(row, atMs))
+      throw new ApiError(
+        409,
+        'SIGNAL_HISTORY_NOT_DELETABLE',
+        '只能删除已完结且最近 48 小时无关联活动的候选记录。',
+      );
+    if (row.signalId) {
+      tx.delete(outboxMessages)
+        .where(eq(outboxMessages.signalId, row.signalId))
+        .run();
+      tx.delete(signals).where(eq(signals.id, row.signalId)).run();
+    }
+    tx.delete(aiReviews).where(eq(aiReviews.candidateId, id)).run();
+    tx.delete(riskEvaluations).where(eq(riskEvaluations.candidateId, id)).run();
+    tx.delete(signalCandidates).where(eq(signalCandidates.id, id)).run();
+    tx.insert(auditLogs)
+      .values({
+        actor,
+        action: 'SIGNAL_HISTORY_DELETED',
+        targetType: 'candidate',
+        targetId: id,
+        createdAtMs: atMs,
+      })
+      .run();
+  });
+}
+
+export function exportSignalHistory(
+  db: AppDatabase,
+  filters: SignalFilters,
+  format: 'csv' | 'json',
+) {
+  const limit = 5_000;
+  const bounded = <T>(rows: T[]) => {
+    if (rows.length > limit)
+      throw new ApiError(
+        422,
+        'SIGNAL_EXPORT_TOO_LARGE',
+        '单次最多导出 5,000 条，请缩小筛选范围。',
+      );
+    return rows;
   };
+  return db.transaction((tx) => {
+    if (format === 'json')
+      return expandDetails(tx, bounded(detailRows(tx, filters, limit + 1))).map(
+        ({ data }) => data,
+      );
+    const rows = bounded(listSignals(tx, { ...filters, limit, offset: 0 }));
+    const cell = (
+      value: string | number | null | undefined,
+      numeric = false,
+    ) => {
+      const text = String(value ?? '');
+      const safe =
+        !numeric && /^\s*[=+\-@\t\r\n]/u.test(text.replaceAll('\0', ''))
+          ? "'" + text
+          : text;
+      return '"' + safe.replaceAll('"', '""') + '"';
+    };
+    const header =
+      'candidate_id,signal_id,exchange,market,product,venue,strategy,version,direction,trigger_utc,pre_risk,final_risk,reason,ai_decision,telegram_status,telegram_message_id,theory_state,observed_bars,gross_r';
+    const lines = rows.map((row) =>
+      [
+        row.id,
+        row.signalId,
+        row.exchange,
+        row.market.nativeSymbol,
+        row.market.productType,
+        row.market.venue,
+        row.strategyId,
+        row.strategyVersion,
+        row.direction,
+        new Date(row.triggerCloseMs).toISOString(),
+        row.outcome,
+        row.finalRisk?.outcome,
+        row.finalRisk?.reasonCode ?? row.reasonCode,
+        row.aiDecision,
+        row.delivery?.status,
+        row.delivery?.telegramMessageId,
+        row.theory?.state,
+        row.theory?.observedBars,
+        row.theory?.grossR,
+      ]
+        .map((value, index) => cell(value, index === 18))
+        .join(','),
+    );
+    return '\uFEFF' + [header, ...lines].join('\r\n') + '\r\n';
+  });
+}
+
+export function summarizeSignals(db: HistoryStore, filters: SignalFilters) {
+  const countIf = (condition: SQL) =>
+    sql`sum(case when ${condition} then 1 else 0 end)`.mapWith(Number);
+  const target = (ordinal: number) =>
+    countIf(
+      sql`exists (select 1 from json_each(${signalOutcomes.progress}, '$.targetsHit') where value = ${ordinal})`,
+    );
+  const sent = db
+    .select({ id: outboxMessages.id })
+    .from(outboxMessages)
+    .where(
+      and(
+        eq(outboxMessages.signalId, signals.id),
+        eq(outboxMessages.kind, 'TRADE_SIGNAL'),
+        eq(outboxMessages.status, 'SENT'),
+      ),
+    );
+  return historyQuery(
+    db,
+    {
+      strategyId: strategyConfigVersions.strategyId,
+      candidates: sql`count(*)`.mapWith(Number),
+      approved: countIf(sql`${signals.id} is not null`),
+      rejected: countIf(
+        sql`coalesce(${finalRisk.outcome}, ${riskEvaluations.outcome}) = 'REJECTED'`,
+      ),
+      sent: countIf(sql`exists ${sent}`),
+      longs: countIf(eq(signalCandidates.direction, 'LONG')),
+      shorts: countIf(eq(signalCandidates.direction, 'SHORT')),
+      aiAccepted: countIf(sql`${aiDecision} = 'ACCEPT'`),
+      aiModified: countIf(sql`${aiDecision} = 'MODIFY'`),
+      aiRejected: countIf(sql`${aiDecision} = 'REJECT'`),
+      tp1: target(1),
+      tp2: target(2),
+      tp3: target(3),
+      tp4: target(4),
+      stopHits: countIf(
+        sql`json_extract(${signalOutcomes.progress}, '$.stopHit') = 1`,
+      ),
+      insufficientData: countIf(
+        sql`${signalOutcomes.waitingForData} = 1 or ${signalOutcomes.reasonCode} = 'DATA_GAP'`,
+      ),
+      completed: sql`count(${signalOutcomes.grossR})`.mapWith(Number),
+      averageGrossR: sql`avg(cast(${signalOutcomes.grossR} as real))`.mapWith(
+        Number,
+      ),
+    },
+    filters,
+  )
+    .groupBy(markets.exchange, strategyConfigVersions.strategyId)
+    .orderBy(asc(markets.exchange), asc(strategyConfigVersions.strategyId))
+    .all()
+    .map(({ tp1, tp2, tp3, tp4, ...group }) => ({
+      ...group,
+      targetHits: [tp1, tp2, tp3, tp4],
+    }));
 }
 
 export function saveCandidates(

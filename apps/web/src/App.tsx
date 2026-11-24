@@ -15,9 +15,13 @@ const MarketWorkspace = lazy(async () => ({
 const NotificationSettings = lazy(async () => ({
   default: (await import('./NotificationSettings')).NotificationSettings,
 }));
+const SignalHistory = lazy(async () => ({
+  default: (await import('./SignalHistory')).SignalHistory,
+}));
 const pageNames = {
   overview: '总览',
   markets: '市场监控',
+  history: '信号历史',
   notifications: '通知与 AI',
 };
 
@@ -123,6 +127,7 @@ function Dashboard({ username }: { username: string }) {
       queryClient.setQueryData(sessionQueryKey, null);
       queryClient.removeQueries({ queryKey: ['market-data'] });
       queryClient.removeQueries({ queryKey: ['notification-settings'] });
+      queryClient.removeQueries({ queryKey: ['signal-history'] });
     },
   });
 
@@ -134,7 +139,11 @@ function Dashboard({ username }: { username: string }) {
 
   return (
     <main
-      className={page === 'markets' ? 'dashboard dashboard-wide' : 'dashboard'}
+      className={
+        page === 'markets' || page === 'history'
+          ? 'dashboard dashboard-wide'
+          : 'dashboard'
+      }
     >
       <nav className="dashboard-nav" aria-label="控制台">
         <button
@@ -150,6 +159,13 @@ function Dashboard({ username }: { username: string }) {
           onClick={() => setPage('markets')}
         >
           市场监控
+        </button>
+        <button
+          type="button"
+          aria-current={page === 'history' ? 'page' : undefined}
+          onClick={() => setPage('history')}
+        >
+          信号历史
         </button>
         <button
           type="button"
@@ -180,6 +196,10 @@ function Dashboard({ username }: { username: string }) {
       {page === 'markets' ? (
         <Suspense fallback={<p role="status">正在加载市场监控…</p>}>
           <MarketWorkspace />
+        </Suspense>
+      ) : page === 'history' ? (
+        <Suspense fallback={<p role="status">正在加载信号历史…</p>}>
+          <SignalHistory />
         </Suspense>
       ) : page === 'notifications' ? (
         <Suspense fallback={<p role="status">正在加载通知设置…</p>}>

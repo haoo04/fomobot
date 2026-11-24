@@ -428,6 +428,17 @@ button:disabled {
   overflow-x: auto;
 }
 
+.history-meta {
+  display: block;
+  color: var(--muted);
+  margin-top: 0.25rem;
+}
+
+.history-events {
+  padding-inline-start: 1.3rem;
+  line-height: 1.65;
+}
+
 .market-table {
   width: 100%;
   border-collapse: collapse;

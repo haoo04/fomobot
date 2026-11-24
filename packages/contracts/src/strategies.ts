@@ -1,10 +1,11 @@
-import { MARKET_TYPES } from '@market-sentinel/domain';
+import { EXCHANGES, MARKET_TYPES } from '@market-sentinel/domain';
 import { z } from 'zod';
 import { timeframeSchema } from './index.js';
 import {
   aiReviewAuditSchema,
   aiReviewStatusSchema,
   deliverySchema,
+  deliveryStatusSchema,
   trailPolicySchema,
 } from './notifications.js';
 
@@ -130,22 +131,97 @@ export const monitorStrategySchema = versionSchema.extend({
   latest: evaluationSchema.nullable(),
 });
 
-export const signalQuerySchema = z.strictObject({
+export const theoryStateSchema = z.enum([
+  'ACTIVE',
+  'TP1_HIT',
+  'TP2_HIT',
+  'TP3_HIT',
+  'TP4_HIT',
+  'SL_HIT',
+  'EXPIRED',
+  'INVALIDATED',
+]);
+
+const signalFiltersSchema = z.strictObject({
   marketId: z.uuid().optional(),
   state: outcomeSchema.optional(),
-  offset: z.coerce.number().int().min(0).default(0),
-  limit: z.coerce.number().int().min(1).max(100).default(20),
+  q: z.string().trim().min(1).max(128).optional(),
+  exchange: z.enum(EXCHANGES).optional(),
+  strategyId: z.string().trim().min(1).max(100).optional(),
+  finalState: outcomeSchema.optional(),
+  deliveryState: deliveryStatusSchema.optional(),
+  theoryState: theoryStateSchema.optional(),
+  fromMs: z.coerce.number().int().nonnegative().optional(),
+  toMs: z.coerce.number().int().nonnegative().optional(),
 });
+const validRange = ({ fromMs, toMs }: z.infer<typeof signalFiltersSchema>) =>
+  fromMs === undefined || toMs === undefined || fromMs < toMs;
+const rangeIssue = { path: ['toMs'], message: '结束时间须晚于开始时间。' };
+export const signalSummaryQuerySchema = signalFiltersSchema.refine(
+  validRange,
+  rangeIssue,
+);
+export const signalExportQuerySchema = signalFiltersSchema
+  .extend({ format: z.enum(['csv', 'json']) })
+  .refine(validRange, rangeIssue);
+export const signalQuerySchema = signalFiltersSchema
+  .extend({
+    offset: z.coerce.number().int().min(0).default(0),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+  })
+  .refine(validRange, rangeIssue);
 
 const reviewSchema = z.object({
   outcome: outcomeSchema,
   reasonCode: z.string().nullable(),
+});
+const theorySummarySchema = z.object({
+  state: theoryStateSchema,
+  startAtMs: timestamp,
+  deadlineAtMs: timestamp,
+  finishedAtMs: timestamp.nullable(),
+  observedBars: z.number().int().min(0).max(20),
+  waitingForData: z.boolean(),
+  grossR: z.string().nullable(),
+  reasonCode: z.string().nullable(),
+});
+const theoryCandleSchema = z.object({
+  openTimeMs: timestamp,
+  closeTimeMs: timestamp,
+  open: priceText,
+  high: priceText,
+  low: priceText,
+  close: priceText,
+  source: z.enum(['WS', 'REST', 'AGGREGATED']),
+});
+const theoryEventSchema = z.object({
+  id: z.number().int().positive(),
+  type: z.enum(['CANDLE', 'TP', 'SL', 'STOP_MOVED', 'EXPIRED', 'INVALIDATED']),
+  atMs: timestamp,
+  target: z.number().int().min(1).max(4).nullable(),
+  price: priceText.nullable(),
+  closePct: percent.nullable(),
+  ambiguousIntrabar: z.boolean(),
+  reasonCode: z.string().nullable(),
+  candle: theoryCandleSchema.nullable(),
+});
+const signalDeliverySchema = deliverySchema.extend({
+  id: z.uuid(),
+  body: z.string(),
+  createdAtMs: timestamp,
 });
 const candidateSchema = versionSchema.extend({
   ...reviewSchema.shape,
   id: z.uuid(),
   marketId: z.uuid(),
   configVersionId: z.uuid(),
+  exchange: z.enum(EXCHANGES),
+  market: z.object({
+    marketType: z.enum(MARKET_TYPES),
+    productType: z.string(),
+    venue: z.string(),
+    nativeSymbol: z.string(),
+  }),
   triggerTimeframe: timeframeSchema,
   triggerOpenMs: timestamp,
   triggerCloseMs: timestamp,
@@ -158,6 +234,7 @@ const candidateSchema = versionSchema.extend({
   aiDecision: z.enum(['ACCEPT', 'REJECT', 'MODIFY']).nullable(),
   aiStatus: aiReviewStatusSchema.nullable(),
   delivery: deliverySchema.nullable(),
+  theory: theorySummarySchema.nullable(),
 });
 
 const riskLevelsSchema = z.object({
@@ -193,6 +270,28 @@ export const signalsResponseSchema = response(
     nextOffset: z.number().int().nonnegative().nullable(),
   }),
 );
+export const signalSummaryResponseSchema = response(
+  z.array(
+    z.object({
+      exchange: z.enum(EXCHANGES),
+      strategyId: z.string(),
+      candidates: timestamp,
+      approved: timestamp,
+      rejected: timestamp,
+      sent: timestamp,
+      longs: timestamp,
+      shorts: timestamp,
+      aiAccepted: timestamp,
+      aiModified: timestamp,
+      aiRejected: timestamp,
+      targetHits: z.array(timestamp).length(4),
+      stopHits: timestamp,
+      insufficientData: timestamp,
+      completed: timestamp,
+      averageGrossR: z.number().nullable(),
+    }),
+  ),
+);
 export const signalResponseSchema = response(
   candidateSchema.extend({
     params: strategyParametersSchema,
@@ -206,8 +305,13 @@ export const signalResponseSchema = response(
         quote: z.record(z.string(), z.unknown()).nullable(),
       })
       .nullable(),
-    deliveries: z.array(deliverySchema),
+    deliveries: z.array(signalDeliverySchema),
+    updates: z.array(signalDeliverySchema),
     canResend: z.boolean(),
+    canDelete: z.boolean(),
+    theoryEvents: z.array(theoryEventSchema),
+    approvedAtMs: timestamp.nullable(),
+    deliveryExpiresAtMs: timestamp.nullable(),
     aiReview: aiReviewAuditSchema
       .extend({
         requestSummary: z.record(z.string(), z.unknown()),
@@ -223,6 +327,10 @@ export type StrategyTimeframes = z.infer<typeof timeframesSchema>;
 export type MonitorStrategy = z.infer<typeof monitorStrategySchema>;
 export type StrategyEvaluation = z.infer<typeof evaluationSchema>;
 export type SignalQuery = z.infer<typeof signalQuerySchema>;
+export type SignalFilters = z.infer<typeof signalSummaryQuerySchema>;
+export type TheoryState = z.infer<typeof theoryStateSchema>;
+export type TheoryEvent = z.infer<typeof theoryEventSchema>;
+export type SignalDetail = z.infer<typeof signalResponseSchema>['data'];
 export type CandidateDirection = z.infer<typeof candidateSchema>['direction'];
 export type CandidateReview = z.infer<typeof reviewSchema>;
 export type RiskLevels = z.infer<typeof riskLevelsSchema>;

@@ -7,7 +7,9 @@ import {
 } from '@market-sentinel/contracts/markets';
 import type { Market, MonitorConfig } from '@market-sentinel/contracts/markets';
 import {
+  signalExportQuerySchema,
   signalQuerySchema,
+  signalSummaryQuerySchema,
   strategyParametersSchema,
 } from '@market-sentinel/contracts/strategies';
 import { MARKET_TYPES } from '@market-sentinel/domain';
@@ -21,18 +23,24 @@ import type { Notifications } from '../notification/service.js';
 import { auditLogs, monitorConfigs } from '../schema.js';
 import type { StrategyService } from '../strategy/service.js';
 import {
+  canDeleteHistory,
+  deleteSignalHistory,
+  exportSignalHistory,
   listSignals,
   saveStrategyVersion,
   signalDetail,
   strategyConfiguration,
   strategyTemplate,
+  summarizeSignals,
 } from '../strategy/store.js';
+import type { SignalTracker } from '../strategy/tracker.js';
 import { monitoredTimeframes } from './model.js';
 import type { MarketData } from './service.js';
 import { configuredMarkets, marketById, marketPage } from './store.js';
 import type { MonitorRow } from './store.js';
 
 const idParameter = z.strictObject({ id: z.uuid() });
+const historyDeleteSchema = z.strictObject({ confirm: z.literal(true) });
 
 function auditRow(
   actor: string,
@@ -69,6 +77,7 @@ export function registerMarketRoutes(
   strategies: StrategyService,
   timeZone: string,
   notifications: Notifications,
+  tracker: SignalTracker,
 ) {
   const actor = (request: FastifyRequest) =>
     requireSession(database, request).username;
@@ -285,6 +294,14 @@ export function registerMarketRoutes(
         .set(candidate)
         .where(eq(monitorConfigs.id, id))
         .run();
+      if (before.enabled)
+        tracker.stopMarket(
+          tx,
+          before.marketId,
+          candidate.enabled ? monitoredTimeframes(candidate) : [],
+          service.now(),
+          candidate.enabled ? 'TIMEFRAME_STOPPED' : 'MONITOR_PAUSED',
+        );
       tx.insert(auditLogs)
         .values(
           auditRow(
@@ -330,6 +347,17 @@ export function registerMarketRoutes(
         .set({ enabled })
         .where(inArray(monitorConfigs.id, ids))
         .run();
+      if (!enabled)
+        for (const row of previous) {
+          if (row.enabled)
+            tracker.stopMarket(
+              tx,
+              row.marketId,
+              [],
+              service.now(),
+              'MONITOR_PAUSED',
+            );
+        }
       const resumed = enabled
         ? previous.filter((row) => !row.enabled).map((row) => row.id)
         : [];
@@ -364,8 +392,15 @@ export function registerMarketRoutes(
     const username = actor(request);
     const { id } = validated(idParameter, request.params);
     database.transaction((tx) => {
-      requireMonitor(id);
+      const monitor = requireMonitor(id);
       tx.delete(monitorConfigs).where(eq(monitorConfigs.id, id)).run();
+      tracker.stopMarket(
+        tx,
+        monitor.marketId,
+        [],
+        service.now(),
+        'MONITOR_DELETED',
+      );
       tx.insert(auditLogs)
         .values(auditRow(username, 'MONITOR_DELETED', id))
         .run();
@@ -413,6 +448,29 @@ export function registerMarketRoutes(
     };
   });
 
+  app.get('/signals/summary', async (request) => {
+    actor(request);
+    const query = validated(signalSummaryQuerySchema, request.query);
+    return { requestId: request.id, data: summarizeSignals(database, query) };
+  });
+
+  app.get('/signals/export', async (request, reply) => {
+    actor(request);
+    const { format, ...query } = validated(
+      signalExportQuerySchema,
+      request.query,
+    );
+    const data = exportSignalHistory(database, query, format);
+    reply.header(
+      'Content-Disposition',
+      `attachment; filename="market-sentinel-signals.${format}"`,
+    );
+    reply.header('X-Request-Id', request.id);
+    if (format === 'csv')
+      return reply.type('text/csv; charset=utf-8').send(data);
+    return { requestId: request.id, data };
+  });
+
   app.get('/signals/:id', async (request) => {
     actor(request);
     const { id } = validated(idParameter, request.params);
@@ -421,7 +479,19 @@ export function registerMarketRoutes(
       throw new ApiError(404, 'SIGNAL_NOT_FOUND', '找不到这条候选记录。');
     return {
       requestId: request.id,
-      data: { ...data, canResend: notifications.canResend(data.signalId) },
+      data: {
+        ...data,
+        canResend: notifications.canResend(data.signalId),
+        canDelete: canDeleteHistory(data, service.now()),
+      },
     };
+  });
+
+  app.delete('/signals/:id', async (request) => {
+    const username = actor(request);
+    const { id } = validated(idParameter, request.params);
+    validated(historyDeleteSchema, request.body);
+    deleteSignalHistory(database, id, service.now(), username);
+    return { requestId: request.id, data: { id } };
   });
 }

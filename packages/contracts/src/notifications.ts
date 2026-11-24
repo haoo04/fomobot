@@ -29,6 +29,7 @@ export const telegramSettingsPatchSchema = z.strictObject({
     .optional(),
   marketDailyLimit: dailyLimit,
   globalDailyLimit: dailyLimit,
+  signalUpdatesEnabled: z.boolean().optional(),
 });
 
 const telegramSettingsSchema = telegramSettingsPatchSchema
@@ -41,6 +42,7 @@ const telegramSettingsSchema = telegramSettingsPatchSchema
     pairingExpiresAtMs: timestamp.nullable(),
     pairingError: z.string().nullable(),
     lastTest: deliverySchema.nullable(),
+    signalUpdatesEnabled: z.boolean(),
   });
 
 export const notificationDiagnosticsSchema = z.object({

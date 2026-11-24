@@ -17,6 +17,7 @@ import { registerNotificationRoutes } from './notification/routes.js';
 import { createNotifications } from './notification/service.js';
 import { administrators } from './schema.js';
 import { createStrategyService } from './strategy/service.js';
+import { createSignalTracker } from './strategy/tracker.js';
 
 const clientErrors: Record<number, readonly [string, string]> = {
   400: ['INVALID_REQUEST', '请求格式无效。'],
@@ -115,6 +116,16 @@ export async function buildApp(
       ),
     options,
   );
+  const tracker = createSignalTracker(
+    database,
+    marketData.now,
+    notifications.enqueueUpdate,
+    () =>
+      app.log.error(
+        { code: 'SIGNAL_TRACKING_FAILED' },
+        'Signal tracking failed',
+      ),
+  );
   await app.register(
     async (api) => {
       registerMarketRoutes(
@@ -124,6 +135,7 @@ export async function buildApp(
         strategies,
         config.APP_TIMEZONE,
         notifications,
+        tracker,
       );
       registerNotificationRoutes(api, database, notifications);
     },
@@ -132,9 +144,11 @@ export async function buildApp(
   app.addHook('onReady', async () => {
     notifications.start();
     strategies.start();
+    tracker.start();
   });
   app.addHook('preClose', async () => {
     strategies.stop();
+    tracker.stop();
     await notifications.stop();
     await marketData.stop();
   });

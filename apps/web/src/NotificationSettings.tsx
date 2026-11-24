@@ -102,6 +102,7 @@ function TelegramSettings() {
       botToken: values.has('useEnvironment') ? null : token || undefined,
       marketDailyLimit: Number(values.get('marketDailyLimit')),
       globalDailyLimit: Number(values.get('globalDailyLimit')),
+      signalUpdatesEnabled: values.has('signalUpdatesEnabled'),
     });
   }
 
@@ -123,7 +124,11 @@ function TelegramSettings() {
       </p>
       <form
         onSubmit={save}
-        key={data.marketDailyLimit + '/' + data.globalDailyLimit}
+        key={[
+          data.marketDailyLimit,
+          data.globalDailyLimit,
+          data.signalUpdatesEnabled,
+        ].join('/')}
       >
         <div className="market-form-grid">
           <label>
@@ -157,6 +162,14 @@ function TelegramSettings() {
               defaultValue={data.globalDailyLimit}
               required
             />
+          </label>
+          <label className="market-check">
+            <input
+              name="signalUpdatesEnabled"
+              type="checkbox"
+              defaultChecked={data.signalUpdatesEnabled}
+            />
+            理论信号更新
           </label>
           {data.storedToken && (
             <label className="market-check">

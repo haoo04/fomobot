@@ -12,12 +12,15 @@ import type {
   RiskLevels,
   StrategyParameters,
   StrategyTimeframes,
+  TheoryEvent,
+  TheoryState,
 } from '@market-sentinel/contracts/strategies';
 import {
   check,
   index,
   integer,
   primaryKey,
+  real,
   sqliteTable,
   text,
   uniqueIndex,
@@ -287,6 +290,9 @@ export const telegramSettings = sqliteTable(
     pairingError: text('pairing_error'),
     marketDailyLimit: integer('market_daily_limit').notNull().default(8),
     globalDailyLimit: integer('global_daily_limit').notNull().default(30),
+    signalUpdatesEnabled: integer('signal_updates_enabled', { mode: 'boolean' })
+      .notNull()
+      .default(true),
   },
   (table) => [check('telegram_singleton', sql`${table.id} = 1`)],
 );
@@ -306,12 +312,81 @@ export const signals = sqliteTable('signals', {
   aiRevision: text('ai_revision'),
 });
 
+export interface TheoryProgress {
+  stops: (string | null)[];
+  realizedR: string;
+  atr: number | null;
+  previousClose: string | null;
+  targetsHit: number[];
+  stopHit: boolean;
+}
+
+export const signalOutcomes = sqliteTable(
+  'signal_outcomes',
+  {
+    signalId: text('signal_id')
+      .primaryKey()
+      .references(() => signals.id, { onDelete: 'cascade' }),
+    state: text('state').$type<TheoryState>().notNull().default('ACTIVE'),
+    startAtMs: integer('start_at_ms').notNull(),
+    deadlineAtMs: integer('deadline_at_ms').notNull(),
+    nextOpenMs: integer('next_open_ms').notNull(),
+    finishedAtMs: integer('finished_at_ms'),
+    observedBars: integer('observed_bars').notNull().default(0),
+    waitingForData: integer('waiting_for_data', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    grossR: text('gross_r'),
+    reasonCode: text('reason_code'),
+    silentBeforeMs: integer('silent_before_ms').notNull(),
+    progress: text('progress_json', { mode: 'json' })
+      .$type<TheoryProgress>()
+      .notNull(),
+  },
+  (table) => [
+    index('signal_outcomes_open')
+      .on(table.nextOpenMs)
+      .where(sql`${table.finishedAtMs} is null`),
+    index('signal_outcomes_state').on(table.state),
+  ],
+);
+
+export const signalEvents = sqliteTable(
+  'signal_events',
+  {
+    id: integer('id').primaryKey(),
+    signalId: text('signal_id')
+      .notNull()
+      .references(() => signals.id, { onDelete: 'cascade' }),
+    type: text('event_type').$type<TheoryEvent['type']>().notNull(),
+    atMs: integer('event_time_ms').notNull(),
+    target: integer('target'),
+    price: text('price'),
+    closePct: real('close_pct'),
+    ambiguousIntrabar: integer('ambiguous_intrabar', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    reasonCode: text('reason_code'),
+    candle: text('candle_json', { mode: 'json' }).$type<
+      TheoryEvent['candle']
+    >(),
+  },
+  (table) => [
+    index('signal_events_signal_time').on(table.signalId, table.atMs),
+  ],
+);
+
 export const outboxMessages = sqliteTable(
   'outbox_messages',
   {
     id: text('id').primaryKey(),
     dedupeKey: text('dedupe_key').notNull().unique(),
     signalId: text('signal_id').references(() => signals.id),
+    kind: text('kind', {
+      enum: ['TRADE_SIGNAL', 'TELEGRAM_TEST', 'SIGNAL_UPDATE', 'SYSTEM_ALERT'],
+    })
+      .notNull()
+      .default('TRADE_SIGNAL'),
     pairingId: text('pairing_id').notNull(),
     chatId: text('chat_id').notNull(),
     body: text('body').notNull(),
