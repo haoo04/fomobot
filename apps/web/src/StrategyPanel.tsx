@@ -11,6 +11,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
 import { request } from './api';
+import { deliveryLabels } from './NotificationSettings';
 
 const outcomes = {
   WAITING: '等待收盘',
@@ -38,9 +39,15 @@ const reasons: Record<string, string> = {
   REJECT_PRICE_DRIFT: '入场参考价偏离触发收盘价',
   REJECT_INVALID_STOP: '止损距离不合格',
   REJECT_INVALID_TARGET: '止盈价位不合格',
+  REJECT_INVALID_ALLOCATION: '止盈分仓比例不合格',
   REJECT_LOW_RR: '加权 R:R 低于阈值',
   SUPPRESS_CONFLICT: '同一触发 K 线出现相反方向',
   SUPPRESS_COOLDOWN: '同方向仍在冷却期',
+  SUPPRESS_TELEGRAM_NOT_PAIRED: 'Telegram 待配对',
+  SUPPRESS_MONITOR_CHANGED: '监控已暂停或配置已变更',
+  DELIVERY_EXPIRED: '信号已过期',
+  SUPPRESS_DAILY_LIMIT: '达到当日通知上限',
+  TELEGRAM_PAIRING_CHANGED: 'Telegram 配对已变更',
   EVALUATION_FAILED: '策略评估失败',
 };
 
@@ -326,6 +333,7 @@ export function StrategyPanel({
     queryFn: () =>
       request('/api/v1/signals/' + selected, signalResponseSchema.parse),
     enabled: open && selected !== null,
+    refetchInterval: open && selected !== null ? 3000 : false,
   });
   const save = useMutation({
     mutationFn: (strategy: StrategyPatch) =>
@@ -333,6 +341,15 @@ export function StrategyPanel({
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ strategy }),
+      }),
+    onSuccess: async () => client.invalidateQueries({ queryKey }),
+  });
+  const resend = useMutation({
+    mutationFn: (id: string) =>
+      request('/api/v1/signals/' + id + '/resend', () => undefined, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
       }),
     onSuccess: async () => client.invalidateQueries({ queryKey }),
   });
@@ -352,6 +369,7 @@ export function StrategyPanel({
   else if (latest) summary = outcomes[latest.outcome];
   else if (incomplete) summary = '阈值待配置';
   const signal = detail.data?.data;
+  const levels = signal?.finalRisk?.levels ?? signal?.levels;
 
   return (
     <details
@@ -395,6 +413,9 @@ export function StrategyPanel({
               <div>
                 <strong>
                   {directions[item.direction]} · {outcomes[item.outcome]}
+                  {item.delivery &&
+                    ' · ' + deliveryLabels[item.delivery.status]}
+                  {item.deliveryPending && ' · 待终审'}
                 </strong>
                 <small>
                   {formatTime(item.triggerCloseMs)} · {item.triggerTimeframe}
@@ -432,17 +453,67 @@ export function StrategyPanel({
                   ' · ' + (reasons[signal.reasonCode] ?? signal.reasonCode)}
               </p>
               <p className="market-meta">配置版本 {signal.configVersionId}</p>
-              {signal.levels && (
+              {signal.finalRisk && (
+                <p className="market-meta">
+                  最终风控 ·{' '}
+                  {signal.finalRisk.outcome === 'PASSED'
+                    ? '通过'
+                    : outcomes[signal.finalRisk.outcome]}
+                  {signal.finalRisk.reasonCode &&
+                    ' · ' +
+                      (reasons[signal.finalRisk.reasonCode] ??
+                        signal.finalRisk.reasonCode)}
+                  {signal.finalRisk.atMs !== null &&
+                    ' · ' + formatTime(signal.finalRisk.atMs)}
+                </p>
+              )}
+              {signal.signalId && (
+                <p className="market-meta">正式信号 {signal.signalId}</p>
+              )}
+              {signal.deliveries.map((delivery) => (
+                <p className="market-meta" key={String(delivery.manual)}>
+                  {delivery.manual ? '补发' : 'Telegram'} ·{' '}
+                  {deliveryLabels[delivery.status]}
+                  {delivery.telegramMessageId &&
+                    ' · 消息 ID ' + delivery.telegramMessageId}
+                  {delivery.sentAtMs !== null &&
+                    ' · ' + formatTime(delivery.sentAtMs)}
+                  {delivery.lastError &&
+                    ' · ' + (reasons[delivery.lastError] ?? delivery.lastError)}
+                </p>
+              ))}
+              {signal.canResend && (
+                <button
+                  type="button"
+                  disabled={resend.isPending}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        'Telegram 可能已送达此信号。确认补发可能重复的消息？',
+                      )
+                    )
+                      resend.mutate(signal.id);
+                  }}
+                >
+                  确认补发
+                </button>
+              )}
+              {resend.isError && resend.variables === signal.id && (
+                <p role="alert" className="error">
+                  {resend.error.message}
+                </p>
+              )}
+              {levels && (
                 <dl className="market-facts">
                   <div>
                     <dt>参考入场</dt>
-                    <dd>{signal.levels.entry}</dd>
+                    <dd>{levels.entry}</dd>
                   </div>
                   <div>
                     <dt>止损</dt>
-                    <dd>{signal.levels.stop}</dd>
+                    <dd>{levels.stop}</dd>
                   </div>
-                  {signal.levels.takeProfits.map((target, i) => (
+                  {levels.takeProfits.map((target, i) => (
                     <div key={target.price}>
                       <dt>
                         TP{i + 1}（{target.closePct}%）
@@ -452,7 +523,7 @@ export function StrategyPanel({
                   ))}
                   <div>
                     <dt>加权 R:R</dt>
-                    <dd>{signal.levels.weightedRR}</dd>
+                    <dd>{levels.weightedRR}</dd>
                   </div>
                 </dl>
               )}

@@ -12,6 +12,10 @@
       "types": "./dist/markets.d.ts",
       "default": "./dist/markets.js"
     },
+    "./notifications": {
+      "types": "./dist/notifications.d.ts",
+      "default": "./dist/notifications.js"
+    },
     "./strategies": {
       "types": "./dist/strategies.d.ts",
       "default": "./dist/strategies.js"

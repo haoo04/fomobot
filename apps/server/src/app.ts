@@ -12,6 +12,8 @@ import type { AppConfig } from './config.js';
 import type { AppDatabase } from './database.js';
 import { registerMarketRoutes } from './market-data/routes.js';
 import { createMarketData, type MarketData } from './market-data/service.js';
+import { registerNotificationRoutes } from './notification/routes.js';
+import { createNotifications } from './notification/service.js';
 import { administrators } from './schema.js';
 import { createStrategyService } from './strategy/service.js';
 
@@ -19,13 +21,14 @@ const clientErrors: Record<number, readonly [string, string]> = {
   400: ['INVALID_REQUEST', '请求格式无效。'],
   413: ['PAYLOAD_TOO_LARGE', '请求内容过大。'],
   415: ['UNSUPPORTED_MEDIA_TYPE', '请求内容类型不受支持。'],
-  429: ['RATE_LIMITED', '登录尝试过于频繁，请稍后再试。'],
+  429: ['RATE_LIMITED', '请求过于频繁，请稍后再试。'],
 };
 
 export async function buildApp(
   database: AppDatabase,
   config: AppConfig,
   marketData: MarketData = createMarketData(database),
+  options: { fetchTelegram?: typeof fetch } = {},
 ) {
   const app = Fastify({
     bodyLimit: 8_192,
@@ -100,20 +103,38 @@ export async function buildApp(
       'Strategy evaluation failed',
     ),
   );
+  const notifications = createNotifications(
+    database,
+    config,
+    marketData,
+    () =>
+      app.log.error(
+        { code: 'NOTIFICATION_TASK_FAILED' },
+        'Notification task failed',
+      ),
+    options.fetchTelegram,
+  );
   await app.register(
-    async (api) =>
+    async (api) => {
       registerMarketRoutes(
         api,
         database,
         marketData,
         strategies,
         config.APP_TIMEZONE,
-      ),
+        notifications,
+      );
+      registerNotificationRoutes(api, database, notifications);
+    },
     { prefix: '/api/v1' },
   );
-  app.addHook('onReady', async () => strategies.start());
+  app.addHook('onReady', async () => {
+    notifications.start();
+    strategies.start();
+  });
   app.addHook('preClose', async () => {
     strategies.stop();
+    await notifications.stop();
     await marketData.stop();
   });
 

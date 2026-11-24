@@ -1,6 +1,7 @@
 import { MARKET_TYPES } from '@market-sentinel/domain';
 import { z } from 'zod';
 import { timeframeSchema } from './index.js';
+import { deliverySchema } from './notifications.js';
 
 const percent = z.number().min(0).max(100);
 const periods = z.number().int().min(1);
@@ -145,6 +146,10 @@ const candidateSchema = versionSchema.extend({
   triggerCloseMs: timestamp,
   evaluatedAtMs: timestamp,
   direction: z.enum(['LONG', 'SHORT', 'BEARISH_WATCH']),
+  deliveryPending: z.boolean(),
+  finalRisk: reviewSchema.nullable(),
+  signalId: z.uuid().nullable(),
+  delivery: deliverySchema.nullable(),
 });
 
 const riskLevelsSchema = z.object({
@@ -180,6 +185,14 @@ export const signalResponseSchema = response(
     timeframes: timeframesSchema,
     configHash: z.string(),
     levels: riskLevelsSchema.nullable(),
+    finalRisk: reviewSchema
+      .extend({
+        levels: riskLevelsSchema.nullable(),
+        atMs: timestamp.nullable(),
+      })
+      .nullable(),
+    deliveries: z.array(deliverySchema),
+    canResend: z.boolean(),
     evidence: z.record(z.string(), z.unknown()),
   }),
 );

@@ -275,7 +275,12 @@ export function reject(
   return { outcome: 'REJECTED', reasonCode, levels };
 }
 
-export function triggerTurnover(bar: Candle) {
+type RiskCandle = Pick<
+  Candle,
+  'close' | 'high' | 'low' | 'baseVolume' | 'quoteTurnover'
+>;
+
+export function triggerTurnover(bar: RiskCandle) {
   return bar.quoteTurnover === null
     ? {
         value: new Exact(bar.low).times(bar.baseVolume!).toFixed(),
@@ -287,11 +292,12 @@ export function triggerTurnover(bar: Candle) {
 export function evaluateRisk(
   market: Market,
   quote: MarketQuote | null,
-  bars: Candle[],
+  bars: RiskCandle[],
   volatility: number,
   direction: 'LONG' | 'SHORT',
   params: StrategyParameters,
   evaluatedAtMs: number,
+  proposal?: Pick<RiskLevels, 'entry' | 'stop' | 'takeProfits'>,
 ): RiskResult {
   const { risk, atr: atrParams } = params;
   const { maxSpreadBps, minTurnover, minStopPct, maxStopPct, maxAtrPct } = risk;
@@ -331,25 +337,34 @@ export function evaluateRisk(
     return reject('REJECT_LIQUIDITY');
 
   const long = direction === 'LONG';
-  const entry = roundPrice(market, long ? sell : buy);
-  if (!entry || entry.lte(0)) return reject('REJECT_PRICE_PRECISION');
+  const bookEntry = roundPrice(market, long ? sell : buy);
+  if (!bookEntry || bookEntry.lte(0)) return reject('REJECT_PRICE_PRECISION');
+  const entry = proposal ? new Exact(proposal.entry) : bookEntry;
+  if (!roundPrice(market, entry)?.eq(entry))
+    return reject('REJECT_PRICE_PRECISION');
   const atrValue = new Exact(volatility);
   if (atrValue.lte(0) || atrValue.times(100).div(bar.close).gt(maxAtrPct))
     return reject('REJECT_VOLATILITY');
-  if (entry.minus(bar.close).abs().gt(atrValue.times(risk.maxEntryDriftAtr)))
+  const maxDrift = atrValue.times(risk.maxEntryDriftAtr);
+  if (
+    bookEntry.minus(bar.close).abs().gt(maxDrift) ||
+    entry.minus(bar.close).abs().gt(maxDrift) ||
+    bookEntry.minus(entry).abs().gt(maxDrift)
+  )
     return reject('REJECT_PRICE_DRIFT');
 
   const swing = bars
     .slice(-risk.swingLookback)
     .map((item) => (long ? item.low : item.high));
   const buffer = atrValue.times(atrParams.stopMultiplier);
-  const stop = roundPrice(
-    market,
-    long
+  const proposedStop = proposal
+    ? new Exact(proposal.stop)
+    : long
       ? Exact.min(Exact.min(...swing), entry.minus(buffer))
-      : Exact.max(Exact.max(...swing), entry.plus(buffer)),
-  );
-  if (!stop || stop.lte(0)) return reject('REJECT_INVALID_STOP');
+      : Exact.max(Exact.max(...swing), entry.plus(buffer));
+  const stop = roundPrice(market, proposedStop);
+  if (!stop || stop.lte(0) || (proposal && !stop.eq(proposedStop)))
+    return reject('REJECT_INVALID_STOP');
   const distance = long ? entry.minus(stop) : stop.minus(entry);
   const stopPct = distance.times(100).div(entry);
   if (distance.lte(0) || stopPct.lt(minStopPct) || stopPct.gt(maxStopPct))
@@ -358,15 +373,33 @@ export function evaluateRisk(
   const takeProfits: RiskLevels['takeProfits'] = [];
   let weightedMove = new Exact(0);
   let previous = entry;
-  for (const target of risk.takeProfits) {
-    const move = distance.times(target.rMultiple);
-    const rounded = roundPrice(
-      market,
-      long ? entry.plus(move) : entry.minus(move),
-    );
+  const targets =
+    proposal?.takeProfits ??
+    risk.takeProfits.map((target) => {
+      const move = distance.times(target.rMultiple);
+      return {
+        closePct: target.closePct,
+        price: (long ? entry.plus(move) : entry.minus(move)).toFixed(),
+      };
+    });
+  if (
+    targets.length < 1 ||
+    targets.length > 4 ||
+    targets.some(
+      ({ closePct }) => !Number.isFinite(closePct) || closePct <= 0,
+    ) ||
+    targets
+      .reduce((total, { closePct }) => total.plus(closePct), new Exact(0))
+      .equals(100) === false
+  )
+    return reject('REJECT_INVALID_ALLOCATION');
+  for (const target of targets) {
+    const value = new Exact(target.price);
+    const rounded = roundPrice(market, value);
     if (
       !rounded ||
       rounded.lte(0) ||
+      (proposal && !rounded.eq(value)) ||
       (long ? rounded.lte(previous) : rounded.gte(previous))
     )
       return reject('REJECT_INVALID_TARGET');

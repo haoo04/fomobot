@@ -13,7 +13,7 @@ const keyVersion = 1;
 const authTagLength = 16;
 
 export function saveSecret(
-  database: AppDatabase,
+  database: Pick<AppDatabase, 'insert'>,
   keyBase64: string,
   value: string,
 ): string {

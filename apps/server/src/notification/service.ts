@@ -1,0 +1,626 @@
+import { randomUUID } from 'node:crypto';
+import type { RiskLevels } from '@market-sentinel/contracts/strategies';
+import { and, count, desc, eq, gt, inArray, lte, or } from 'drizzle-orm';
+import { z } from 'zod';
+import { ApiError } from '../api-error.js';
+import type { AppConfig } from '../config.js';
+import type { AppDatabase } from '../database.js';
+import { decimal, price } from '../market-data/model.js';
+import type { MarketData } from '../market-data/service.js';
+import { marketById } from '../market-data/store.js';
+import {
+  auditLogs,
+  monitorConfigs,
+  outboxMessages,
+  riskEvaluations,
+  signalCandidates,
+  signals,
+  strategyConfigVersions,
+} from '../schema.js';
+import { evaluateRisk, reject, type RiskResult } from '../strategy/evaluate.js';
+import { signalDetail } from '../strategy/store.js';
+import { createTelegram } from './telegram.js';
+
+type Candidate = NonNullable<ReturnType<typeof signalDetail>>;
+type Outbox = typeof outboxMessages.$inferSelect;
+type MarketSource = Pick<MarketData, 'now' | 'view' | 'strategyMarket'>;
+const countedDeliveries = ['SENDING', 'SENT', 'DELIVERY_UNKNOWN'] as const;
+const snapshotSchema = z.object({
+  candles: z.object({
+    trigger: z.object({
+      last: z.object({
+        close: price,
+        high: price,
+        low: price,
+        baseVolume: decimal,
+        quoteTurnover: decimal.nullable(),
+      }),
+    }),
+  }),
+  indicators: z.object({ atr: z.number().positive() }),
+  openInterest: z
+    .object({
+      latest: z.object({ timestampMs: z.number().int().nonnegative() }),
+      deltaPct: z.number(),
+    })
+    .nullable(),
+});
+
+function suppressed(
+  reasonCode: string,
+  levels: RiskLevels | null = null,
+): RiskResult {
+  return { outcome: 'SUPPRESSED', reasonCode, levels };
+}
+
+export function createNotifications(
+  db: AppDatabase,
+  config: AppConfig,
+  marketData: MarketSource,
+  onError: () => void,
+  fetchTelegram?: typeof fetch,
+) {
+  const { now } = marketData;
+  const telegram = createTelegram(db, config, now, fetchTelegram);
+  const day = new Intl.DateTimeFormat('en-CA', {
+    timeZone: config.APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const displayTime = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: config.APP_TIMEZONE,
+    dateStyle: 'short',
+    timeStyle: 'medium',
+  });
+  const lifecycle = new AbortController();
+  const tasks = new Map<() => Promise<void> | void, Promise<void>>();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let recoverOutbox = true;
+
+  function check(candidate: Candidate, levels: RiskLevels, atMs: number) {
+    const { marketId, direction, params, triggerCloseMs, timeframes } =
+      candidate;
+    const { quote, available } = marketData.strategyMarket(marketId);
+    const row = marketById(db, marketId);
+    const market = row ? marketData.view(row) : null;
+    let risk: RiskResult;
+    const monitor = db
+      .select()
+      .from(monitorConfigs)
+      .where(eq(monitorConfigs.marketId, marketId))
+      .get();
+    const snapshot = snapshotSchema.safeParse(candidate.evidence);
+    if (
+      atMs < triggerCloseMs ||
+      atMs >= triggerCloseMs + params.risk.maxAgeSeconds * 1000
+    ) {
+      risk = reject('REJECT_STALE_DATA');
+    } else if (
+      !monitor?.enabled ||
+      !monitor.strategyEnabled ||
+      (monitor.strategyConfigVersionId !== null &&
+        monitor.strategyConfigVersionId !== candidate.configVersionId) ||
+      triggerCloseMs <= monitor.strategyAfterMs
+    ) {
+      risk = suppressed('SUPPRESS_MONITOR_CHANGED');
+    } else if (
+      !market ||
+      market.status !== 'ACTIVE' ||
+      market.stale ||
+      !available ||
+      !Object.values(timeframes).every((timeframe) =>
+        market.capabilities.intervals.includes(timeframe),
+      )
+    ) {
+      risk = reject('REJECT_MARKET_UNAVAILABLE');
+    } else if (!snapshot.success || direction === 'BEARISH_WATCH') {
+      risk = reject('REJECT_INCOMPLETE_CANDLE');
+    } else {
+      const { candles, indicators, openInterest } = snapshot.data;
+      const oi = params.oi;
+      risk =
+        oi &&
+        (!openInterest ||
+          openInterest.latest.timestampMs > triggerCloseMs ||
+          atMs - openInterest.latest.timestampMs > oi.maxAgeSeconds * 1000 ||
+          openInterest.deltaPct < oi.minIncreasePct)
+          ? reject('REJECT_OI_UNAVAILABLE')
+          : evaluateRisk(
+              market,
+              quote,
+              [candles.trigger.last],
+              indicators.atr,
+              direction,
+              params,
+              atMs,
+              levels,
+            );
+    }
+    return { risk, quote, market, snapshot: snapshot.data };
+  }
+
+  function tickSignals() {
+    const next = db
+      .select({ id: signalCandidates.id })
+      .from(signalCandidates)
+      .where(eq(signalCandidates.deliveryPending, true))
+      .orderBy(signalCandidates.triggerCloseMs, signalCandidates.evaluatedAtMs)
+      .get();
+    if (!next) return;
+    const candidate = signalDetail(db, next.id)!;
+    const atMs = now();
+    const { pairing } = telegram.current();
+    const result = check(candidate, candidate.levels!, atMs);
+    let risk = result.risk;
+    if (risk.outcome === 'PASSED' && !pairing)
+      risk = suppressed('SUPPRESS_TELEGRAM_NOT_PAIRED', risk.levels);
+    db.transaction((tx) => {
+      const cooldown = candidate.params.risk.cooldownMinutes * 60_000;
+      if (risk.outcome === 'PASSED' && cooldown > 0) {
+        const recent = tx
+          .select({ id: signals.id })
+          .from(signals)
+          .innerJoin(
+            signalCandidates,
+            eq(signalCandidates.id, signals.candidateId),
+          )
+          .innerJoin(
+            strategyConfigVersions,
+            eq(strategyConfigVersions.id, signalCandidates.configVersionId),
+          )
+          .innerJoin(outboxMessages, eq(outboxMessages.signalId, signals.id))
+          .where(
+            and(
+              eq(signalCandidates.marketId, candidate.marketId),
+              eq(signalCandidates.direction, candidate.direction),
+              eq(strategyConfigVersions.strategyId, candidate.strategyId),
+              gt(
+                signalCandidates.triggerCloseMs,
+                candidate.triggerCloseMs - cooldown,
+              ),
+              or(
+                inArray(outboxMessages.status, ['SENT', 'DELIVERY_UNKNOWN']),
+                and(
+                  inArray(outboxMessages.status, ['PENDING', 'SENDING']),
+                  gt(outboxMessages.expiresAtMs, atMs),
+                ),
+              ),
+            ),
+          )
+          .get();
+        if (recent) risk = suppressed('SUPPRESS_COOLDOWN', risk.levels);
+      }
+      tx.insert(riskEvaluations)
+        .values({
+          candidateId: candidate.id,
+          stage: 'FINAL',
+          ...risk,
+          atMs,
+          quote: result.quote,
+        })
+        .run();
+      tx.update(signalCandidates)
+        .set({ deliveryPending: false })
+        .where(eq(signalCandidates.id, candidate.id))
+        .run();
+      if (
+        risk.outcome !== 'PASSED' ||
+        !risk.levels ||
+        !pairing ||
+        !result.market
+      )
+        return;
+      const id = randomUUID();
+      const expiresAtMs =
+        candidate.triggerCloseMs + candidate.params.risk.maxAgeSeconds * 1000;
+      const { entry, stop, takeProfits, weightedRR } = risk.levels;
+      const {
+        exchange,
+        nativeSymbol,
+        productType,
+        quoteAsset,
+        isRwa,
+        isReality,
+      } = result.market;
+      const unit = quoteAsset ? ' ' + quoteAsset : '';
+      const long = candidate.direction === 'LONG';
+      const reasons =
+        (long
+          ? '趋势 EMA 多头排列，确认周期 RSI 回升，触发周期放量'
+          : '趋势 EMA 空头排列，确认周期 RSI 回落，触发周期放量') +
+        (candidate.params.breakPreviousCandle ? (long ? '突破' : '跌破') : '');
+      const body = [
+        '[规则信号] ' + (long ? '做多 LONG' : '做空 SHORT'),
+        '时间 ' +
+          displayTime.format(candidate.triggerCloseMs) +
+          ' (' +
+          config.APP_TIMEZONE +
+          ')',
+        '市场 ' +
+          (exchange === 'BITGET' ? 'Bitget' : 'Hyperliquid') +
+          ' | ' +
+          nativeSymbol +
+          ' | ' +
+          productType,
+        '策略 ' +
+          candidate.strategyId +
+          ' v' +
+          candidate.strategyVersion +
+          ' · ' +
+          candidate.timeframes.trend +
+          '趋势 / ' +
+          candidate.timeframes.confirm +
+          '确认 / ' +
+          candidate.timeframes.trigger +
+          '触发',
+        'K 线收盘 ' + result.snapshot?.candles.trigger.last.close + unit,
+        '参考入场 ' + entry + unit,
+        'SL ' + stop + unit,
+        ...takeProfits.map(
+          (target, index) =>
+            'TP' +
+            (index + 1) +
+            ' ' +
+            target.price +
+            unit +
+            '（' +
+            target.closePct +
+            '%）',
+        ),
+        '加权 R:R ' + weightedRR,
+        '理由 ' + reasons + (candidate.params.oi ? '，OI 达到策略阈值' : ''),
+        ...(isRwa || isReality
+          ? ['风险 参考市场休市时可能出现流动性和基差变化。']
+          : []),
+        '策略提醒。请考虑手续费和滑点。',
+      ].join('\n');
+      const footer = '\n信号 ID ' + id;
+      tx.insert(signals)
+        .values({
+          id,
+          candidateId: candidate.id,
+          levels: risk.levels,
+          approvedAtMs: atMs,
+          expiresAtMs,
+        })
+        .run();
+      tx.insert(outboxMessages)
+        .values({
+          id: randomUUID(),
+          dedupeKey: 'signal:' + id,
+          signalId: id,
+          pairingId: pairing.id,
+          chatId: pairing.chatId,
+          body: body.slice(0, 4096 - footer.length) + footer,
+          nextAttemptMs: atMs,
+          createdAtMs: atMs,
+          expiresAtMs,
+        })
+        .run();
+    });
+  }
+
+  async function tickOutbox() {
+    if (lifecycle.signal.aborted) return;
+    if (recoverOutbox) {
+      db.update(outboxMessages)
+        .set({
+          status: 'DELIVERY_UNKNOWN',
+          lastError: 'TELEGRAM_SEND_INTERRUPTED',
+        })
+        .where(eq(outboxMessages.status, 'SENDING'))
+        .run();
+      recoverOutbox = false;
+    }
+    const atMs = now();
+    const { pairing, marketDailyLimit, globalDailyLimit } = telegram.current();
+    const item = db.transaction((tx) => {
+      const pending = tx
+        .select()
+        .from(outboxMessages)
+        .where(
+          and(
+            eq(outboxMessages.status, 'PENDING'),
+            lte(outboxMessages.nextAttemptMs, atMs),
+          ),
+        )
+        .orderBy(outboxMessages.nextAttemptMs, outboxMessages.createdAtMs)
+        .get();
+      if (!pending) return undefined;
+      let reason: string | null = null;
+      if (pending.expiresAtMs <= atMs) reason = 'DELIVERY_EXPIRED';
+      else if (
+        !pairing ||
+        pending.pairingId !== pairing.id ||
+        pending.chatId !== pairing.chatId
+      )
+        reason = 'TELEGRAM_PAIRING_CHANGED';
+      if (
+        !reason &&
+        tx
+          .select({ id: outboxMessages.id })
+          .from(outboxMessages)
+          .where(
+            and(
+              eq(outboxMessages.pairingId, pending.pairingId),
+              eq(outboxMessages.lastError, 'TELEGRAM_HTTP_429'),
+              gt(outboxMessages.nextAttemptMs, atMs),
+            ),
+          )
+          .get()
+      )
+        return undefined;
+      if (!reason && pending.signalId) {
+        const signal = tx
+          .select()
+          .from(signals)
+          .where(eq(signals.id, pending.signalId))
+          .get()!;
+        const candidate = signalDetail(db, signal.candidateId)!;
+        const { risk } = check(candidate, signal.levels, atMs);
+        reason = risk.reasonCode;
+        if (!reason) {
+          const counts = tx
+            .select({ marketId: signalCandidates.marketId, total: count() })
+            .from(outboxMessages)
+            .innerJoin(signals, eq(signals.id, outboxMessages.signalId))
+            .innerJoin(
+              signalCandidates,
+              eq(signalCandidates.id, signals.candidateId),
+            )
+            .where(
+              and(
+                eq(outboxMessages.sendDay, day.format(atMs)),
+                inArray(outboxMessages.status, countedDeliveries),
+              ),
+            )
+            .groupBy(signalCandidates.marketId)
+            .all();
+          if (
+            (counts.find((row) => row.marketId === candidate.marketId)?.total ??
+              0) >= marketDailyLimit ||
+            counts.reduce((total, row) => total + row.total, 0) >=
+              globalDailyLimit
+          )
+            reason = 'SUPPRESS_DAILY_LIMIT';
+        }
+      }
+      const claim = eq(outboxMessages.id, pending.id);
+      if (reason) {
+        tx.update(outboxMessages)
+          .set({ status: 'FAILED', lastError: reason })
+          .where(claim)
+          .run();
+        return undefined;
+      }
+      tx.update(outboxMessages)
+        .set({
+          status: 'SENDING',
+          attempts: pending.attempts + 1,
+          sendDay: day.format(atMs),
+          lastError: null,
+        })
+        .where(claim)
+        .run();
+      return pending;
+    });
+    if (!item || !pairing) return;
+    const result = await telegram.send(
+      pairing.token,
+      pairing.chatId,
+      item.body,
+      lifecycle.signal,
+    );
+    const where = and(
+      eq(outboxMessages.id, item.id),
+      eq(outboxMessages.status, 'SENDING'),
+    );
+    if (result.ok) {
+      db.update(outboxMessages)
+        .set({
+          status: 'SENT',
+          telegramMessageId: String(result.data.message_id),
+          sentAtMs: now(),
+        })
+        .where(where)
+        .run();
+      return;
+    }
+    const nextAttemptMs =
+      now() + Math.max(result.retryAfterMs ?? 0, 1000 * 2 ** item.attempts);
+    const canRetry =
+      result.retryAfterMs !== null &&
+      item.attempts + 1 < 3 &&
+      nextAttemptMs < item.expiresAtMs &&
+      !item.manual;
+    db.update(outboxMessages)
+      .set({
+        status:
+          result.code === 'TELEGRAM_RESPONSE_UNKNOWN'
+            ? 'DELIVERY_UNKNOWN'
+            : canRetry
+              ? 'PENDING'
+              : 'FAILED',
+        lastError: result.code,
+        nextAttemptMs,
+      })
+      .where(where)
+      .run();
+  }
+
+  function enqueueTest(actor: string) {
+    const { pairing } = telegram.current();
+    if (!pairing)
+      throw new ApiError(
+        409,
+        'TELEGRAM_NOT_PAIRED',
+        '请先配对 Telegram 私聊。',
+      );
+    const id = randomUUID();
+    const atMs = now();
+    db.transaction((tx) => {
+      tx.insert(outboxMessages)
+        .values({
+          id,
+          dedupeKey: 'test:' + id,
+          pairingId: pairing.id,
+          chatId: pairing.chatId,
+          body: 'Market Sentinel Telegram 测试消息',
+          createdAtMs: atMs,
+          nextAttemptMs: atMs,
+          expiresAtMs: atMs + 60_000,
+        })
+        .run();
+      tx.insert(auditLogs)
+        .values({
+          actor,
+          action: 'TELEGRAM_TEST',
+          targetType: 'outbox',
+          targetId: id,
+          createdAtMs: atMs,
+        })
+        .run();
+    });
+    return telegram.settings();
+  }
+
+  function resendable(signalId: string | null): Outbox | undefined {
+    const { pairing } = telegram.current();
+    if (!signalId || !pairing) return;
+    const rows = db
+      .select()
+      .from(outboxMessages)
+      .where(eq(outboxMessages.signalId, signalId))
+      .all();
+    if (rows.length !== 1) return;
+    const [item] = rows;
+    if (
+      item &&
+      item.status === 'DELIVERY_UNKNOWN' &&
+      item.expiresAtMs > now() &&
+      item.pairingId === pairing.id &&
+      item.chatId === pairing.chatId
+    )
+      return item;
+  }
+
+  function resend(candidateId: string, actor: string) {
+    const candidate = signalDetail(db, candidateId);
+    if (!candidate)
+      throw new ApiError(404, 'SIGNAL_NOT_FOUND', '找不到这条候选记录。');
+    const atMs = now();
+    db.transaction((tx) => {
+      const item = resendable(candidate.signalId);
+      if (
+        !item ||
+        !candidate.levels ||
+        !candidate.finalRisk?.levels ||
+        check(candidate, candidate.finalRisk.levels, atMs).risk.outcome !==
+          'PASSED'
+      )
+        throw new ApiError(
+          409,
+          'DELIVERY_NOT_RESENDABLE',
+          '此信号当前无法补发。',
+        );
+      const id = randomUUID();
+      tx.insert(outboxMessages)
+        .values({
+          id,
+          dedupeKey: 'resend:' + item.signalId,
+          signalId: item.signalId,
+          pairingId: item.pairingId,
+          chatId: item.chatId,
+          body: '补发 · 可能重复\n' + item.body.slice(0, 4084),
+          manual: true,
+          nextAttemptMs: atMs,
+          createdAtMs: atMs,
+          expiresAtMs: item.expiresAtMs,
+        })
+        .run();
+      tx.insert(auditLogs)
+        .values({
+          actor,
+          action: 'TELEGRAM_RESEND',
+          targetType: 'outbox',
+          targetId: id,
+          createdAtMs: atMs,
+        })
+        .run();
+    });
+  }
+
+  function diagnostics() {
+    const counts = db
+      .select({ status: outboxMessages.status, total: count() })
+      .from(outboxMessages)
+      .where(
+        inArray(outboxMessages.status, [
+          'PENDING',
+          'SENDING',
+          'DELIVERY_UNKNOWN',
+        ]),
+      )
+      .groupBy(outboxMessages.status)
+      .all();
+    const latest = db
+      .select({
+        approvedAtMs: signals.approvedAtMs,
+        triggerCloseMs: signalCandidates.triggerCloseMs,
+      })
+      .from(signals)
+      .innerJoin(signalCandidates, eq(signalCandidates.id, signals.candidateId))
+      .orderBy(desc(signals.approvedAtMs))
+      .get();
+    return {
+      pending: counts
+        .filter((row) => row.status !== 'DELIVERY_UNKNOWN')
+        .reduce((total, row) => total + row.total, 0),
+      deliveryUnknown:
+        counts.find((row) => row.status === 'DELIVERY_UNKNOWN')?.total ?? 0,
+      lastQueueDelayMs: latest
+        ? latest.approvedAtMs - latest.triggerCloseMs
+        : null,
+    };
+  }
+
+  const tickPair = () => telegram.poll(lifecycle.signal);
+  function schedule(task: () => Promise<void> | void) {
+    if (tasks.has(task)) return;
+    tasks.set(
+      task,
+      Promise.resolve()
+        .then(task)
+        .catch(onError)
+        .finally(() => tasks.delete(task)),
+    );
+  }
+  return {
+    telegram,
+    enqueueTest,
+    resend,
+    diagnostics,
+    tickSignals,
+    tickOutbox,
+    tickPair,
+    canResend: (signalId: string | null) => !!resendable(signalId),
+    start() {
+      if (timer || lifecycle.signal.aborted) return;
+      timer = setInterval(() => {
+        schedule(tickSignals);
+        schedule(tickOutbox);
+        schedule(tickPair);
+      }, 1000);
+      timer.unref();
+    },
+    async stop() {
+      clearInterval(timer);
+      timer = undefined;
+      lifecycle.abort();
+      await Promise.all(tasks.values());
+    },
+  };
+}
+
+export type Notifications = ReturnType<typeof createNotifications>;

@@ -12,6 +12,14 @@ const sessionQueryKey = ['session'];
 const MarketWorkspace = lazy(async () => ({
   default: (await import('./MarketWorkspace')).MarketWorkspace,
 }));
+const NotificationSettings = lazy(async () => ({
+  default: (await import('./NotificationSettings')).NotificationSettings,
+}));
+const pageNames = {
+  overview: '总览',
+  markets: '市场监控',
+  notifications: '通知与 AI',
+};
 
 function Login() {
   const queryClient = useQueryClient();
@@ -86,7 +94,7 @@ function Login() {
 
 function Dashboard({ username }: { username: string }) {
   const queryClient = useQueryClient();
-  const [page, setPage] = useState<'overview' | 'markets'>('overview');
+  const [page, setPage] = useState<keyof typeof pageNames>('overview');
   const live = useQuery({
     queryKey: ['health', 'live'],
     queryFn: () => request('/health/live', livenessResponseSchema.parse),
@@ -114,6 +122,7 @@ function Dashboard({ username }: { username: string }) {
       await queryClient.cancelQueries({ queryKey: sessionQueryKey });
       queryClient.setQueryData(sessionQueryKey, null);
       queryClient.removeQueries({ queryKey: ['market-data'] });
+      queryClient.removeQueries({ queryKey: ['notification-settings'] });
     },
   });
 
@@ -142,9 +151,16 @@ function Dashboard({ username }: { username: string }) {
         >
           市场监控
         </button>
+        <button
+          type="button"
+          aria-current={page === 'notifications' ? 'page' : undefined}
+          onClick={() => setPage('notifications')}
+        >
+          通知与 AI
+        </button>
       </nav>
       <div className="dashboard-heading">
-        <h1>{page === 'markets' ? '市场监控' : '总览'}</h1>
+        <h1>{pageNames[page]}</h1>
         <div className="account">
           <span>{username}</span>
           <button
@@ -164,6 +180,10 @@ function Dashboard({ username }: { username: string }) {
       {page === 'markets' ? (
         <Suspense fallback={<p role="status">正在加载市场监控…</p>}>
           <MarketWorkspace />
+        </Suspense>
+      ) : page === 'notifications' ? (
+        <Suspense fallback={<p role="status">正在加载通知设置…</p>}>
+          <NotificationSettings />
         </Suspense>
       ) : (
         <section aria-label="系统状态" className="status-grid">

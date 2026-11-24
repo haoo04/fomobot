@@ -519,7 +519,7 @@ test('invalidates a pending trigger when parameters change and protects a gap', 
   expect(history()).toHaveLength(0);
 });
 
-test('suppresses conflicts and cooldown, and rolls candidate and pre-risk back atomically', () => {
+test('suppresses conflicts and rolls candidate and pre-risk back atomically', () => {
   migrateDatabase(db);
   const { market, config } = seedMarket('BITGET', 'PERP');
   const at = closeTime + 6000;
@@ -537,7 +537,7 @@ test('suppresses conflicts and cooldown, and rolls candidate and pre-risk back a
   db.$client.exec('DROP TRIGGER fail_risk');
   saveCandidates(db, trigger, timeframes, config, [...proposals], {}, at);
   const later = candle(market, '3m', closeTime + duration['3m'], 101.2, 102);
-  const suppressed = saveCandidates(
+  const next = saveCandidates(
     db,
     later,
     timeframes,
@@ -546,9 +546,9 @@ test('suppresses conflicts and cooldown, and rolls candidate and pre-risk back a
     {},
     at + duration['3m'],
   );
-  expect(suppressed[0]).toMatchObject({
-    outcome: 'SUPPRESSED',
-    reasonCode: 'SUPPRESS_COOLDOWN',
+  expect(next[0]).toMatchObject({
+    outcome: 'PASSED',
+    reasonCode: null,
   });
   const conflictBar = candle(
     market,

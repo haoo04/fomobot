@@ -36,6 +36,7 @@ const environmentSchema = z
       .default('Asia/Kuala_Lumpur'),
     APP_ENCRYPTION_KEY_BASE64: secretSchema,
     SESSION_SECRET: secretSchema,
+    TELEGRAM_BOT_TOKEN: z.string().trim().optional(),
     LOG_LEVEL: z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),

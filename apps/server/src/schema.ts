@@ -234,6 +234,9 @@ export const signalCandidates = sqliteTable(
     evidence: text('evidence_json', { mode: 'json' })
       .$type<Record<string, unknown>>()
       .notNull(),
+    deliveryPending: integer('delivery_pending', { mode: 'boolean' })
+      .notNull()
+      .default(false),
   },
   (table) => [
     uniqueIndex('candidates_idempotency').on(table.idempotencyKey),
@@ -243,6 +246,9 @@ export const signalCandidates = sqliteTable(
       table.triggerCloseMs,
     ),
     index('candidates_recent').on(table.evaluatedAtMs, table.id),
+    index('candidates_delivery_pending')
+      .on(table.triggerCloseMs)
+      .where(sql`${table.deliveryPending} = 1`),
   ],
 );
 
@@ -252,10 +258,73 @@ export const riskEvaluations = sqliteTable(
     candidateId: text('candidate_id')
       .notNull()
       .references(() => signalCandidates.id),
-    stage: text('stage', { enum: ['PRE'] }).notNull(),
+    stage: text('stage', { enum: ['PRE', 'FINAL'] }).notNull(),
     outcome: text('outcome').$type<CandidateReview['outcome']>().notNull(),
     reasonCode: text('reason_code'),
     levels: text('levels_json', { mode: 'json' }).$type<RiskLevels>(),
+    atMs: integer('evaluated_at_ms'),
+    quote: text('quote_json', { mode: 'json' }).$type<MarketQuote>(),
   },
   (table) => [primaryKey({ columns: [table.candidateId, table.stage] })],
+);
+
+export const telegramSettings = sqliteTable(
+  'telegram_settings',
+  {
+    id: integer('id').primaryKey(),
+    tokenRef: text('token_ref').references(() => secretStore.id),
+    botFingerprint: text('bot_fingerprint'),
+    botUsername: text('bot_username'),
+    pairingId: text('pairing_id'),
+    chatId: text('chat_id'),
+    codeHash: text('code_hash'),
+    codeExpiresAtMs: integer('code_expires_at_ms'),
+    updateOffset: integer('update_offset'),
+    pairingError: text('pairing_error'),
+    marketDailyLimit: integer('market_daily_limit').notNull().default(8),
+    globalDailyLimit: integer('global_daily_limit').notNull().default(30),
+  },
+  (table) => [check('telegram_singleton', sql`${table.id} = 1`)],
+);
+
+export const signals = sqliteTable('signals', {
+  id: text('id').primaryKey(),
+  candidateId: text('candidate_id')
+    .notNull()
+    .unique()
+    .references(() => signalCandidates.id),
+  levels: text('levels_json', { mode: 'json' }).$type<RiskLevels>().notNull(),
+  approvedAtMs: integer('approved_at_ms').notNull(),
+  expiresAtMs: integer('expires_at_ms').notNull(),
+});
+
+export const outboxMessages = sqliteTable(
+  'outbox_messages',
+  {
+    id: text('id').primaryKey(),
+    dedupeKey: text('dedupe_key').notNull().unique(),
+    signalId: text('signal_id').references(() => signals.id),
+    pairingId: text('pairing_id').notNull(),
+    chatId: text('chat_id').notNull(),
+    body: text('body').notNull(),
+    manual: integer('manual', { mode: 'boolean' }).notNull().default(false),
+    status: text('status', {
+      enum: ['PENDING', 'SENDING', 'SENT', 'FAILED', 'DELIVERY_UNKNOWN'],
+    })
+      .notNull()
+      .default('PENDING'),
+    attempts: integer('attempts').notNull().default(0),
+    nextAttemptMs: integer('next_attempt_ms').notNull(),
+    expiresAtMs: integer('expires_at_ms').notNull(),
+    createdAtMs: integer('created_at_ms').notNull(),
+    sendDay: text('send_day'),
+    sentAtMs: integer('sent_at_ms'),
+    telegramMessageId: text('telegram_message_id'),
+    lastError: text('last_error'),
+  },
+  (table) => [
+    index('outbox_due').on(table.status, table.nextAttemptMs),
+    index('outbox_signal').on(table.signalId),
+    index('outbox_send_day').on(table.sendDay),
+  ],
 );

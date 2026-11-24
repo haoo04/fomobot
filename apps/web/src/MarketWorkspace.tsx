@@ -477,6 +477,26 @@ export function MarketWorkspace() {
             )}
           </div>
         ))}
+        {diagnostics.data && (
+          <div className="panel status-card">
+            <h2>通知队列</h2>
+            <div className="provider-metrics">
+              <span>待发 {diagnostics.data.data.notifications.pending}</span>
+              <span>
+                送达不确定 {diagnostics.data.data.notifications.deliveryUnknown}
+              </span>
+            </div>
+            {diagnostics.data.data.notifications.lastQueueDelayMs !== null && (
+              <small>
+                最近入队延迟{' '}
+                {(
+                  diagnostics.data.data.notifications.lastQueueDelayMs / 1000
+                ).toFixed(1)}{' '}
+                秒
+              </small>
+            )}
+          </div>
+        )}
         {diagnostics.isPending && <p role="status">正在读取行情来源…</p>}
         {diagnostics.isError && (
           <p className="error" role="alert">

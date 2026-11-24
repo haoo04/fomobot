@@ -1,5 +1,6 @@
 import { EXCHANGES, MARKET_TYPES, TIMEFRAMES } from '@market-sentinel/domain';
 import { z } from 'zod';
+import { notificationDiagnosticsSchema } from './notifications.js';
 import {
   marketCapabilitiesSchema,
   marketIdentitySchema,
@@ -173,6 +174,7 @@ export const diagnosticsResponseSchema = response(
     syncing: z.boolean(),
     timeZone: z.string(),
     providers: z.array(providerDiagnosticsSchema),
+    notifications: notificationDiagnosticsSchema,
   }),
 );
 export const syncResponseSchema = response(z.object({ syncing: z.boolean() }));

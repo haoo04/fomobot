@@ -6,14 +6,18 @@ import type {
   StrategyTimeframes,
 } from '@market-sentinel/contracts/strategies';
 import type { Candle, MarketType } from '@market-sentinel/domain';
-import { and, desc, eq, gt, lt } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/sqlite-core';
 import type { AppDatabase } from '../database.js';
 import {
   riskEvaluations,
+  outboxMessages,
   signalCandidates,
+  signals,
   strategyConfigVersions,
 } from '../schema.js';
 import type { MonitorRow } from '../market-data/store.js';
+import { deliveryFields } from '../notification/telegram.js';
 import type { RiskResult } from './evaluate.js';
 
 type Store = Pick<AppDatabase, 'select' | 'insert'>;
@@ -113,6 +117,11 @@ export function saveStrategyVersion(
     .get()!;
 }
 
+const finalRisk = alias(riskEvaluations, 'final_risk');
+const finalFields = {
+  outcome: finalRisk.outcome,
+  reasonCode: finalRisk.reasonCode,
+};
 const fields = {
   id: signalCandidates.id,
   marketId: signalCandidates.marketId,
@@ -127,11 +136,22 @@ const fields = {
   direction: signalCandidates.direction,
   outcome: riskEvaluations.outcome,
   reasonCode: riskEvaluations.reasonCode,
+  deliveryPending: signalCandidates.deliveryPending,
+  signalId: signals.id,
 };
 
-export function listSignals(db: AppDatabase, query: SignalQuery) {
+function deliveriesFor(db: AppDatabase, ids: string[]) {
   return db
-    .select(fields)
+    .select({ ...deliveryFields, signalId: outboxMessages.signalId })
+    .from(outboxMessages)
+    .where(inArray(outboxMessages.signalId, ids))
+    .orderBy(desc(outboxMessages.manual))
+    .all();
+}
+
+export function listSignals(db: AppDatabase, query: SignalQuery) {
+  const rows = db
+    .select({ ...fields, finalRisk: finalFields })
     .from(signalCandidates)
     .innerJoin(
       strategyConfigVersions,
@@ -144,6 +164,14 @@ export function listSignals(db: AppDatabase, query: SignalQuery) {
         eq(riskEvaluations.stage, 'PRE'),
       ),
     )
+    .leftJoin(
+      finalRisk,
+      and(
+        eq(finalRisk.candidateId, signalCandidates.id),
+        eq(finalRisk.stage, 'FINAL'),
+      ),
+    )
+    .leftJoin(signals, eq(signals.candidateId, signalCandidates.id))
     .where(
       and(
         query.marketId
@@ -156,10 +184,18 @@ export function listSignals(db: AppDatabase, query: SignalQuery) {
     .limit(query.limit + 1)
     .offset(query.offset)
     .all();
+  const deliveries = deliveriesFor(
+    db,
+    rows.flatMap((row) => row.signalId ?? []),
+  );
+  return rows.map((row) => ({
+    ...row,
+    delivery: deliveries.find((item) => item.signalId === row.signalId) ?? null,
+  }));
 }
 
 export function signalDetail(db: AppDatabase, id: string) {
-  return db
+  const row = db
     .select({
       ...fields,
       params: strategyConfigVersions.params,
@@ -167,6 +203,12 @@ export function signalDetail(db: AppDatabase, id: string) {
       configHash: strategyConfigVersions.configHash,
       levels: riskEvaluations.levels,
       evidence: signalCandidates.evidence,
+      finalRisk: {
+        ...finalFields,
+        levels: finalRisk.levels,
+        atMs: finalRisk.atMs,
+        quote: finalRisk.quote,
+      },
     })
     .from(signalCandidates)
     .innerJoin(
@@ -180,8 +222,19 @@ export function signalDetail(db: AppDatabase, id: string) {
         eq(riskEvaluations.stage, 'PRE'),
       ),
     )
+    .leftJoin(
+      finalRisk,
+      and(
+        eq(finalRisk.candidateId, signalCandidates.id),
+        eq(finalRisk.stage, 'FINAL'),
+      ),
+    )
+    .leftJoin(signals, eq(signals.candidateId, signalCandidates.id))
     .where(eq(signalCandidates.id, id))
     .get();
+  if (!row) return undefined;
+  const deliveries = row.signalId ? deliveriesFor(db, [row.signalId]) : [];
+  return { ...row, delivery: deliveries[0] ?? null, deliveries };
 }
 
 export function saveCandidates(
@@ -225,52 +278,12 @@ export function saveCandidates(
         .get();
       if (existing) return existing;
 
-      if (risk.outcome === 'PASSED') {
-        if (conflict) {
-          risk = {
-            ...risk,
-            outcome: 'SUPPRESSED',
-            reasonCode: 'SUPPRESS_CONFLICT',
-          };
-        } else if (config.params.risk.cooldownMinutes > 0) {
-          const previous = tx
-            .select({ id: signalCandidates.id })
-            .from(signalCandidates)
-            .innerJoin(
-              strategyConfigVersions,
-              eq(strategyConfigVersions.id, signalCandidates.configVersionId),
-            )
-            .innerJoin(
-              riskEvaluations,
-              and(
-                eq(riskEvaluations.candidateId, signalCandidates.id),
-                eq(riskEvaluations.stage, 'PRE'),
-              ),
-            )
-            .where(
-              and(
-                eq(signalCandidates.marketId, trigger.marketId),
-                eq(signalCandidates.direction, direction),
-                eq(strategyConfigVersions.strategyId, config.strategyId),
-                eq(riskEvaluations.outcome, 'PASSED'),
-                lt(signalCandidates.triggerCloseMs, trigger.closeTimeMs),
-                gt(
-                  signalCandidates.triggerCloseMs,
-                  trigger.closeTimeMs -
-                    config.params.risk.cooldownMinutes * 60_000,
-                ),
-              ),
-            )
-            .limit(1)
-            .get();
-          if (previous)
-            risk = {
-              ...risk,
-              outcome: 'SUPPRESSED',
-              reasonCode: 'SUPPRESS_COOLDOWN',
-            };
-        }
-      }
+      if (risk.outcome === 'PASSED' && conflict)
+        risk = {
+          ...risk,
+          outcome: 'SUPPRESSED',
+          reasonCode: 'SUPPRESS_CONFLICT',
+        };
 
       const id = randomUUID();
       tx.insert(signalCandidates)
@@ -285,6 +298,10 @@ export function saveCandidates(
           direction,
           evaluatedAtMs: atMs,
           evidence,
+          deliveryPending:
+            direction !== 'BEARISH_WATCH' &&
+            risk.outcome === 'PASSED' &&
+            risk.levels !== null,
         })
         .run();
       tx.insert(riskEvaluations)

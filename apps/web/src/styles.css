@@ -233,6 +233,7 @@ button:disabled {
 
 .dashboard-nav {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
   margin-bottom: 1.4rem;
 }
@@ -333,7 +334,9 @@ button:disabled {
 }
 
 .market-panel select,
-.market-panel input[type='search'] {
+.market-panel input[type='search'],
+.notification-panel select,
+.notification-panel input:not([type='checkbox']) {
   width: 100%;
   min-width: 0;
   padding: 0.55rem;
@@ -346,6 +349,12 @@ button:disabled {
 
 .market-panel input[type='checkbox'] {
   accent-color: var(--accent);
+}
+
+.notification-panel {
+  display: grid;
+  gap: 0.85rem;
+  overflow-wrap: anywhere;
 }
 
 .market-editor,

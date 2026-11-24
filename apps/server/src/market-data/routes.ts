@@ -14,9 +14,10 @@ import { MARKET_TYPES } from '@market-sentinel/domain';
 import { eq, inArray } from 'drizzle-orm';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { ApiError } from '../api-error.js';
+import { ApiError, validated } from '../api-error.js';
 import { requireSession } from '../auth.js';
 import type { AppDatabase } from '../database.js';
+import type { Notifications } from '../notification/service.js';
 import { auditLogs, monitorConfigs } from '../schema.js';
 import type { StrategyService } from '../strategy/service.js';
 import {
@@ -32,21 +33,6 @@ import { configuredMarkets, marketById, marketPage } from './store.js';
 import type { MonitorRow } from './store.js';
 
 const idParameter = z.strictObject({ id: z.uuid() });
-
-function validated<T>(schema: z.ZodType<T>, value: unknown): T {
-  const result = schema.safeParse(value);
-  if (!result.success)
-    throw new ApiError(
-      400,
-      'INVALID_REQUEST',
-      '请检查请求参数。',
-      result.error.issues.map((issue) => ({
-        field: issue.path.join('.'),
-        code: issue.code,
-      })),
-    );
-  return result.data;
-}
 
 function auditRow(
   actor: string,
@@ -82,6 +68,7 @@ export function registerMarketRoutes(
   service: MarketData,
   strategies: StrategyService,
   timeZone: string,
+  notifications: Notifications,
 ) {
   const actor = (request: FastifyRequest) =>
     requireSession(database, request).username;
@@ -392,7 +379,11 @@ export function registerMarketRoutes(
     actor(request);
     return {
       requestId: request.id,
-      data: { ...service.diagnostics(), timeZone },
+      data: {
+        ...service.diagnostics(),
+        timeZone,
+        notifications: notifications.diagnostics(),
+      },
     };
   });
 
@@ -427,6 +418,9 @@ export function registerMarketRoutes(
     const data = signalDetail(database, id);
     if (!data)
       throw new ApiError(404, 'SIGNAL_NOT_FOUND', '找不到这条候选记录。');
-    return { requestId: request.id, data };
+    return {
+      requestId: request.id,
+      data: { ...data, canResend: notifications.canResend(data.signalId) },
+    };
   });
 }
