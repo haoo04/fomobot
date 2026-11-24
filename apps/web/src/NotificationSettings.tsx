@@ -103,6 +103,7 @@ function TelegramSettings() {
       marketDailyLimit: Number(values.get('marketDailyLimit')),
       globalDailyLimit: Number(values.get('globalDailyLimit')),
       signalUpdatesEnabled: values.has('signalUpdatesEnabled'),
+      systemAlertsEnabled: values.has('systemAlertsEnabled'),
     });
   }
 
@@ -128,6 +129,7 @@ function TelegramSettings() {
           data.marketDailyLimit,
           data.globalDailyLimit,
           data.signalUpdatesEnabled,
+          data.systemAlertsEnabled,
         ].join('/')}
       >
         <div className="market-form-grid">
@@ -170,6 +172,14 @@ function TelegramSettings() {
               defaultChecked={data.signalUpdatesEnabled}
             />
             理论信号更新
+          </label>
+          <label className="market-check">
+            <input
+              name="systemAlertsEnabled"
+              type="checkbox"
+              defaultChecked={data.systemAlertsEnabled}
+            />
+            系统健康告警
           </label>
           {data.storedToken && (
             <label className="market-check">

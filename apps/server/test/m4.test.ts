@@ -4,12 +4,19 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  statSync,
   rmdirSync,
   unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { startOfCalendarDay } from '@market-sentinel/contracts';
+import {
+  diagnosticsResponseSchema,
+  overviewResponseSchema,
+} from '@market-sentinel/contracts/markets';
 import {
   signalResponseSchema,
   signalsResponseSchema,
@@ -26,20 +33,29 @@ import { readConfig } from '../src/config.js';
 import {
   migrateDatabase,
   openDatabase,
+  restoreDatabase,
+  verifyDatabaseFile,
   type AppDatabase,
 } from '../src/database.js';
 import { createMarketData } from '../src/market-data/service.js';
-import { storeCandles } from '../src/market-data/store.js';
+import { saveOi, saveQuote, storeCandles } from '../src/market-data/store.js';
 import { createNotifications } from '../src/notification/service.js';
+import { createOperations } from '../src/operations.js';
 import {
+  administrators,
   auditLogs,
+  candles,
   markets,
   monitorConfigs,
   outboxMessages,
+  oiSnapshots,
+  quotes,
   riskEvaluations,
+  sessions,
   signalCandidates,
   signalOutcomes,
   signals,
+  systemEvents,
   telegramSettings,
 } from '../src/schema.js';
 import {
@@ -68,13 +84,14 @@ beforeEach(() => {
 });
 afterEach(() => db.$client.close());
 
-function config() {
+function config(env: NodeJS.ProcessEnv = {}) {
   return readConfig({
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
     TELEGRAM_BOT_TOKEN: token,
     APP_ENCRYPTION_KEY_BASE64: randomBytes(32).toString('base64'),
     SESSION_SECRET: randomBytes(32).toString('base64'),
+    ...env,
   });
 }
 
@@ -608,3 +625,321 @@ test('a settled candidate can be deleted after 48 hours with related records and
     { action: 'SIGNAL_HISTORY_DELETED', targetId: f.candidateId },
   ]);
 });
+
+test('health incidents persist once, report recovery and honor the Telegram alert switch', async () => {
+  migrateDatabase(db);
+  fixture().originalSent();
+  const settings = config();
+  const data = createMarketData(db, { now: () => clock });
+  let connected = false;
+  const transport = vi.fn(async () =>
+    Response.json({ ok: true, result: { message_id: 101 } }),
+  );
+  const queue = createNotifications(db, settings, data, () => undefined, {
+    fetchTelegram: transport,
+  });
+  const log = vi.fn();
+  const operations = createOperations(
+    db,
+    settings,
+    {
+      now: data.now,
+      diagnostics: () => ({
+        syncing: false,
+        providers: data.diagnostics().providers.map((provider) => ({
+          ...provider,
+          connection: connected ? 'CONNECTED' : 'RECONNECTING',
+        })),
+      }),
+    },
+    queue,
+    log,
+  );
+  expect(queue.telegram.settings()).toMatchObject({
+    systemAlertsEnabled: true,
+    signalUpdatesEnabled: true,
+  });
+  await operations.tick();
+  clock += 2 * minute;
+  await operations.tick();
+  await operations.tick();
+  expect(operations.diagnostics().active).toMatchObject([
+    { source: 'BITGET', code: 'WS_DISCONNECTED', state: 'OPEN' },
+  ]);
+  await queue.tickOutbox();
+  expect(operations.diagnostics().active[0]?.delivery?.status).toBe('SENT');
+  expect(queue.telegram.settings().lastTest).toBeNull();
+
+  connected = true;
+  clock += minute;
+  await operations.tick();
+  await queue.tickOutbox();
+  expect(operations.diagnostics().active).toEqual([]);
+  expect(operations.diagnostics().alerts.map(({ state }) => state)).toEqual([
+    'RECOVERED',
+    'OPEN',
+  ]);
+  expect(transport).toHaveBeenCalledTimes(2);
+
+  queue.telegram.save(
+    { marketDailyLimit: 1, globalDailyLimit: 1, systemAlertsEnabled: false },
+    'admin',
+  );
+  operations.databaseUnavailable();
+  operations.databaseUnavailable();
+  clock += minute;
+  await operations.tick();
+  expect(log).toHaveBeenCalledExactlyOnceWith('DATABASE_UNAVAILABLE');
+  expect(operations.diagnostics().alerts.slice(0, 2)).toMatchObject([
+    { code: 'DATABASE_UNAVAILABLE', state: 'RECOVERED', delivery: null },
+    { code: 'DATABASE_UNAVAILABLE', state: 'OPEN', delivery: null },
+  ]);
+  expect(
+    db
+      .select()
+      .from(outboxMessages)
+      .where(eq(outboxMessages.kind, 'SYSTEM_ALERT'))
+      .all(),
+  ).toHaveLength(2);
+});
+
+test('authenticated overview counts the local calendar day and original sends by actual send time', async () => {
+  migrateDatabase(db);
+  clock = Date.UTC(2026, 10, 24, 15, 59, 58);
+  const previousDay = fixture({ symbol: 'PREVIOUS' });
+  previousDay.originalSent();
+  clock += 4_000;
+  db.update(outboxMessages).set({ sentAtMs: clock }).run();
+  fixture({ symbol: 'TODAY' });
+  const settings = config();
+  expect(startOfCalendarDay('2026-11-01', 'America/New_York')).toBe(
+    Date.UTC(2026, 10, 1, 4),
+  );
+  expect(startOfCalendarDay('2026-11-02', 'America/New_York')).toBe(
+    Date.UTC(2026, 10, 2, 5),
+  );
+  const app = await buildApp(
+    db,
+    settings,
+    createMarketData(db, { now: () => clock }),
+  );
+  const credentials = {
+    username: 'admin',
+    password: 'another-fixture-password',
+  };
+  await initializeAdministrator(db, credentials);
+  try {
+    expect((await app.inject('/api/v1/overview')).statusCode).toBe(401);
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      headers: { origin: settings.WEB_ORIGIN },
+      payload: credentials,
+    });
+    const headers = {
+      cookie: String(login.headers['set-cookie']).split(';')[0]!,
+    };
+    const overview = await app.inject({ url: '/api/v1/overview', headers });
+    expect(overview.statusCode, overview.body).toBe(200);
+    expect(overviewResponseSchema.parse(overview.json()).data).toMatchObject({
+      monitors: 2,
+      candidates: 1,
+      rejected: 0,
+      sent: 1,
+      recentSignals: [
+        { candidateId: previousDay.candidateId, symbol: 'PREVIOUS' },
+      ],
+    });
+    const diagnostics = await app.inject({
+      url: '/api/v1/diagnostics',
+      headers,
+    });
+    expect(
+      diagnosticsResponseSchema.parse(diagnostics.json()).data.system.active,
+    ).toEqual([]);
+  } finally {
+    await app.close();
+  }
+});
+
+test('a real budget rejection produces one system alert per application calendar date', async () => {
+  migrateDatabase(db);
+  fixture().originalSent();
+  const settings = config({
+    AI_REVIEW_ENABLED: 'true',
+    AI_DAILY_BUDGET_USD: '0',
+    OPENAI_API_KEY: 'sk-fixture',
+  });
+  const data = createMarketData(db, { now: () => clock });
+  const reviewOpenAI = vi.fn(async () => {
+    throw new Error('should not call the provider');
+  });
+  const queue = createNotifications(db, settings, data, () => undefined, {
+    reviewOpenAI,
+  });
+  const ops = createOperations(db, settings, data, queue, () => undefined);
+  await queue.testAi('admin');
+  await queue.testAi('admin');
+  await ops.tick();
+  await ops.tick();
+  expect(reviewOpenAI).not.toHaveBeenCalled();
+  expect(ops.diagnostics().alerts).toMatchObject([
+    {
+      code: 'AI_BUDGET_EXHAUSTED',
+      detail: { date: '2026-11-24' },
+      delivery: { status: 'PENDING' },
+    },
+  ]);
+});
+
+test('daily WAL backup gates cleanup and the verified snapshot restores the full signal history', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'market-sentinel-m4-ops-'));
+  const previousDb = db;
+  const livePath = join(directory, 'live.sqlite');
+  const backupDir = livePath + '.backups';
+  const day = 86_400_000;
+  db = openDatabase(livePath);
+  try {
+    migrateDatabase(db);
+    db.$client.exec('PRAGMA wal_autocheckpoint = 0');
+    const f = fixture({ symbol: 'WARM' });
+    f.originalSent();
+    const stopped = fixture({ symbol: 'OLD' });
+    db.update(monitorConfigs)
+      .set({ enabled: false })
+      .where(eq(monitorConfigs.id, stopped.monitorId))
+      .run();
+    const track = tracker();
+    storeCandles(db, [f.candle(f.start, { high: '108' })]);
+    clock = f.start + minute + 5_000;
+    track.tick();
+    db.update(outboxMessages)
+      .set({ status: 'SENDING' })
+      .where(eq(outboxMessages.signalId, f.signalId))
+      .run();
+    db.update(signalCandidates)
+      .set({ deliveryPending: true })
+      .where(eq(signalCandidates.id, stopped.candidateId))
+      .run();
+    storeCandles(
+      db,
+      Array.from({ length: 502 }, (_, index) =>
+        f.candle(base - 400 * day + index * minute),
+      ),
+    );
+    storeCandles(db, [stopped.candle(base - 400 * day)]);
+    db.insert(administrators)
+      .values({
+        id: 1,
+        username: 'admin',
+        passwordHash: 'fixture',
+        createdAtMs: clock,
+      })
+      .run();
+    db.insert(sessions)
+      .values({
+        administratorId: 1,
+        tokenHash: 'fixture-session',
+        expiresAtMs: clock + day,
+      })
+      .run();
+    saveOi(
+      db,
+      [0, 181].map((days) => ({
+        marketId: f.marketId,
+        timestampMs: base - days * day,
+        value: '10',
+        unit: 'USD_NOTIONAL',
+        unitDetails: 'notional',
+        series: 'fixture',
+        source: 'REST',
+        qualityFlags: [],
+      })),
+    );
+    saveQuote(db, f.marketId, {
+      last: { value: '100', timestampMs: base - 31 * day, source: 'REST' },
+      mark: null,
+      bid: null,
+      ask: null,
+      spread: null,
+    });
+    expect(statSync(livePath + '-wal').size).toBeGreaterThan(0);
+    const settings = config({ CANDLE_RETENTION_DAYS_BY_TIMEFRAME: '{"1m":1}' });
+    const data = createMarketData(db, { now: () => clock });
+    const queue = createNotifications(db, settings, data, () => undefined);
+    const ops = createOperations(db, settings, data, queue, () => undefined);
+    clock = Date.UTC(2026, 10, 24, 19, 0);
+    writeFileSync(backupDir, 'blocked');
+    await ops.tick();
+    expect(db.select().from(candles).all()).toHaveLength(504);
+    expect(ops.diagnostics().active.map(({ code }) => code)).toContain(
+      'BACKUP_FAILED',
+    );
+    unlinkSync(backupDir);
+    clock += 15 * minute;
+    await ops.tick();
+    expect(ops.diagnostics()).toMatchObject({
+      latestBackupAtMs: clock,
+      latestCleanupAtMs: clock,
+    });
+    expect(db.select().from(candles).all()).toHaveLength(500);
+    expect(db.select().from(oiSnapshots).all()).toHaveLength(1);
+    expect(db.select().from(quotes).all()).toEqual([]);
+    expect(
+      db
+        .select()
+        .from(systemEvents)
+        .where(eq(systemEvents.code, 'RETENTION_COMPLETE'))
+        .all(),
+    ).toMatchObject([{ detail: { candles: 4, openInterest: 1, quotes: 1 } }]);
+
+    const backupPath = join(backupDir, 'backup-2026-11-25.sqlite');
+    const restoredPath = join(directory, 'restored.sqlite');
+    await verifyDatabaseFile(backupPath);
+    await restoreDatabase(backupPath, restoredPath, clock);
+    await expect(
+      restoreDatabase(backupPath, restoredPath, clock),
+    ).rejects.toThrow('RESTORE_TARGET_IN_USE');
+    const restored = openDatabase(restoredPath);
+    try {
+      const history = signalDetail(restored, f.candidateId);
+      expect(history?.theory?.state).toBe('TP2_HIT');
+      expect(history?.theoryEvents).toHaveLength(3);
+      expect(history?.deliveries[0]).toMatchObject({
+        status: 'DELIVERY_UNKNOWN',
+        lastError: 'RESTORED_DELIVERY_UNCERTAIN',
+      });
+      expect(signalDetail(restored, stopped.candidateId)?.deliveryPending).toBe(
+        false,
+      );
+      expect(restored.select().from(candles).all()).toHaveLength(504);
+      expect(restored.select().from(sessions).all()).toHaveLength(0);
+      expect(db.select().from(sessions).all()).toHaveLength(1);
+    } finally {
+      restored.$client.close();
+    }
+
+    for (let offset = 15; offset < 23; offset++)
+      copyFileSync(
+        backupPath,
+        join(backupDir, `backup-2026-11-${offset}.sqlite`),
+      );
+    clock += day;
+    await ops.tick();
+    expect(
+      readdirSync(backupDir).filter((name) => name.endsWith('.sqlite')),
+    ).toHaveLength(7);
+    expect(readdirSync(backupDir)).toContain('backup-2026-11-26.sqlite');
+  } finally {
+    db.$client.close();
+    db = previousDb;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const target = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        for (const file of readdirSync(target)) unlinkSync(join(target, file));
+        rmdirSync(target);
+      } else unlinkSync(target);
+    }
+    rmdirSync(directory);
+  }
+}, 15_000);

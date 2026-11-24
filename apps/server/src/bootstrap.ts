@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { loginRequestSchema } from '@market-sentinel/contracts';
 import { buildApp } from './app.js';
 import { initializeAdministrator } from './auth.js';
@@ -7,7 +8,7 @@ import {
   readConfig,
   SetupError,
 } from './config.js';
-import { migrateDatabase, openDatabase } from './database.js';
+import { migrateDatabase, openDatabase, restoreDatabase } from './database.js';
 import { createMarketData } from './market-data/service.js';
 
 const administratorCredentialsSchema = loginRequestSchema.extend({
@@ -17,8 +18,32 @@ const administratorCredentialsSchema = loginRequestSchema.extend({
 async function main() {
   loadLocalEnvironment();
   const command = process.argv[2] ?? 'serve';
+  if (command === 'restore') {
+    const [source, destination] = process.argv.slice(3);
+    const pathKey = (path: string) =>
+      process.platform === 'win32'
+        ? resolve(path).toLowerCase()
+        : resolve(path);
+    if (
+      !source ||
+      !destination ||
+      pathKey(destination) === pathKey(databasePath())
+    )
+      throw new SetupError('请提供备份文件及不同于当前数据库的新文件路径。');
+    try {
+      await restoreDatabase(source, destination);
+    } catch {
+      throw new SetupError(
+        '恢复失败。请检查备份完整性、目标目录权限及目标文件是否已存在。',
+      );
+    }
+    console.log('已恢复至新的 SQLite 文件。');
+    return;
+  }
   if (!['serve', 'migrate', 'admin:init'].includes(command)) {
-    throw new SetupError('支持的命令为 serve、migrate 和 admin:init。');
+    throw new SetupError(
+      '支持的命令为 serve、migrate、restore 和 admin:init。',
+    );
   }
 
   const config = command === 'serve' ? readConfig() : null;

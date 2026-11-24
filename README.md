@@ -73,6 +73,17 @@ npm.cmd run dev
 - 已结束且至少 48 小时无关联活动的记录可以逐条确认删除，保留管理员删除审计。
 - 「通知与 AI」可关闭默认开启的理论信号更新。更新发往收到原提醒的同一私聊，与交易提醒分开计入单市场和全局每日上限。
 
+## 运行告警与数据库维护
+
+- 「总览」显示当日候选、拒绝、送达和最近告警。系统健康通知默认开启，可在「通知与 AI」关闭。行情接口持续异常时产生告警，恢复后记录恢复事件。
+- 服务在应用时区 03:00–05:00 内执行每日 SQLite 在线备份，验证完整性后保留最近 7 份。默认备份目录为 `data/market-sentinel.sqlite.backups`。当日备份验证通过后，服务才会分批清理旧行情。
+- K 线默认保留 365 天。可设置 `CANDLE_RETENTION_DAYS_BY_TIMEFRAME` 为 JSON 对象，例如 `{"1m":90,"1d":730}`。OI 默认保留 180 天，可通过 `OI_RETENTION_DAYS` 调整。最后报价保留 30 天。清理保护活跃监控预热和未结算信号所需行情。
+- 恢复命令输出一个全新数据库文件。切换服务前停止原实例，更新 `DATABASE_URL` 并沿用原加密密钥。使用原管理员账号重新登录，恢复时待发和在途消息的状态为送达不确定。
+
+```powershell
+npm.cmd run db:restore -- "data/market-sentinel.sqlite.backups/backup-2026-11-24.sqlite" "data/market-sentinel-restored.sqlite"
+```
+
 ## 检查
 
 ```powershell

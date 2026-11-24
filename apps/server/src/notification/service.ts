@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { systemEventLabels } from '@market-sentinel/contracts/notifications';
 import type { RiskLevels } from '@market-sentinel/contracts/strategies';
 import { and, count, desc, eq, gt, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
@@ -16,6 +17,7 @@ import {
   signalCandidates,
   signals,
   strategyConfigVersions,
+  systemEvents,
 } from '../schema.js';
 import { evaluateRisk, reject, type RiskResult } from '../strategy/evaluate.js';
 import { signalDetail } from '../strategy/store.js';
@@ -504,6 +506,56 @@ export function createNotifications(
       .run();
   };
 
+  function enqueueAlert(
+    store: Pick<AppDatabase, 'select' | 'insert'>,
+    event: Pick<
+      typeof systemEvents.$inferSelect,
+      'id' | 'code' | 'source' | 'state' | 'createdAtMs'
+    >,
+  ) {
+    const { pairing, systemAlertsEnabled } = telegram.current();
+    if (!pairing || !systemAlertsEnabled || lifecycle.signal.aborted) return;
+    const prior = store
+      .select({ id: outboxMessages.id })
+      .from(outboxMessages)
+      .innerJoin(
+        systemEvents,
+        eq(systemEvents.id, outboxMessages.systemEventId),
+      )
+      .where(
+        and(
+          eq(systemEvents.code, event.code),
+          eq(systemEvents.source, event.source),
+          eq(systemEvents.state, event.state),
+          eq(outboxMessages.pairingId, pairing.id),
+          gt(outboxMessages.createdAtMs, event.createdAtMs - 30 * 60_000),
+        ),
+      )
+      .get();
+    if (prior) return;
+    store
+      .insert(outboxMessages)
+      .values({
+        id: randomUUID(),
+        dedupeKey: 'alert:' + event.id,
+        kind: 'SYSTEM_ALERT',
+        systemEventId: event.id,
+        pairingId: pairing.id,
+        chatId: pairing.chatId,
+        body: [
+          event.state === 'RECOVERED' ? '[系统恢复]' : '[系统告警]',
+          event.source,
+          systemEventLabels[event.code] ?? event.code,
+          displayTime.format(event.createdAtMs),
+        ].join(' · '),
+        createdAtMs: event.createdAtMs,
+        nextAttemptMs: event.createdAtMs,
+        expiresAtMs: event.createdAtMs + 15 * 60_000,
+      })
+      .onConflictDoNothing()
+      .run();
+  }
+
   async function tickOutbox() {
     if (lifecycle.signal.aborted) return;
     if (recoverOutbox) {
@@ -522,6 +574,7 @@ export function createNotifications(
       marketDailyLimit,
       globalDailyLimit,
       signalUpdatesEnabled,
+      systemAlertsEnabled,
     } = telegram.current();
     const item = db.transaction((tx) => {
       const pending = tx
@@ -548,6 +601,8 @@ export function createNotifications(
         pending.chatId !== pairing.chatId
       )
         reason = 'TELEGRAM_PAIRING_CHANGED';
+      else if (pending.kind === 'SYSTEM_ALERT' && !systemAlertsEnabled)
+        reason = 'SYSTEM_ALERTS_DISABLED';
       if (
         !reason &&
         tx
@@ -854,6 +909,7 @@ export function createNotifications(
     testAi,
     enqueueTest,
     enqueueUpdate,
+    enqueueAlert,
     resend,
     diagnostics,
     tickSignals,

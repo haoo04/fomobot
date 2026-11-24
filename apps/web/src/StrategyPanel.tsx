@@ -62,6 +62,8 @@ const reasons: Record<string, string> = {
   TIMEFRAME_STOPPED: '原周期已停采',
   COLLECTION_UNAVAILABLE: '原周期当前未采集',
   DATA_GAP: '追踪窗口行情不完整',
+  RESTORED_DELIVERY_UNCERTAIN: '从备份恢复，原送达状态待确认',
+  RESTORED_CANDIDATE_SUPPRESSED: '从备份恢复，历史候选已停止通知处理',
 };
 
 function numberField(
@@ -517,6 +519,8 @@ export function SignalAudit({
       {signal.signalId && (
         <p className="market-meta">
           正式信号 {signal.signalId}
+          {signal.approvedAtMs !== null &&
+            ' · 批准于 ' + formatTime(signal.approvedAtMs)}
           {' · ' + (signal.signalMode === 'AI_REVIEW' ? 'AI 审核' : '规则模式')}
         </p>
       )}

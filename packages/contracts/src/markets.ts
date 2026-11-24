@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   aiUsageSchema,
   notificationDiagnosticsSchema,
+  systemDiagnosticsSchema,
 } from './notifications.js';
 import {
   marketCapabilitiesSchema,
@@ -179,6 +180,26 @@ export const diagnosticsResponseSchema = response(
     providers: z.array(providerDiagnosticsSchema),
     notifications: notificationDiagnosticsSchema,
     ai: aiUsageSchema,
+    system: systemDiagnosticsSchema,
+  }),
+);
+export const overviewResponseSchema = response(
+  z.object({
+    timeZone: z.string(),
+    monitors: timestamp,
+    candidates: timestamp,
+    rejected: timestamp,
+    sent: timestamp,
+    recentSignals: z.array(
+      z.object({
+        signalId: z.uuid(),
+        candidateId: z.uuid(),
+        exchange: z.enum(EXCHANGES),
+        symbol: z.string(),
+        sentAtMs: timestamp,
+      }),
+    ),
+    system: systemDiagnosticsSchema,
   }),
 );
 export const syncResponseSchema = response(z.object({ syncing: z.boolean() }));

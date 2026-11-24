@@ -3,6 +3,8 @@ import {
   livenessResponseSchema,
   readinessResponseSchema,
 } from '@market-sentinel/contracts';
+import { overviewResponseSchema } from '@market-sentinel/contracts/markets';
+import { systemEventLabels } from '@market-sentinel/contracts/notifications';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { lazy, Suspense, useState } from 'react';
 import type { FormEvent } from 'react';
@@ -99,6 +101,7 @@ function Login() {
 function Dashboard({ username }: { username: string }) {
   const queryClient = useQueryClient();
   const [page, setPage] = useState<keyof typeof pageNames>('overview');
+  const [historyCandidate, setHistoryCandidate] = useState<string | null>(null);
   const live = useQuery({
     queryKey: ['health', 'live'],
     queryFn: () => request('/health/live', livenessResponseSchema.parse),
@@ -128,6 +131,7 @@ function Dashboard({ username }: { username: string }) {
       queryClient.removeQueries({ queryKey: ['market-data'] });
       queryClient.removeQueries({ queryKey: ['notification-settings'] });
       queryClient.removeQueries({ queryKey: ['signal-history'] });
+      queryClient.removeQueries({ queryKey: ['overview'] });
     },
   });
 
@@ -163,7 +167,10 @@ function Dashboard({ username }: { username: string }) {
         <button
           type="button"
           aria-current={page === 'history' ? 'page' : undefined}
-          onClick={() => setPage('history')}
+          onClick={() => {
+            setHistoryCandidate(null);
+            setPage('history');
+          }}
         >
           信号历史
         </button>
@@ -199,37 +206,171 @@ function Dashboard({ username }: { username: string }) {
         </Suspense>
       ) : page === 'history' ? (
         <Suspense fallback={<p role="status">正在加载信号历史…</p>}>
-          <SignalHistory />
+          <SignalHistory initialCandidateId={historyCandidate} />
         </Suspense>
       ) : page === 'notifications' ? (
         <Suspense fallback={<p role="status">正在加载通知设置…</p>}>
           <NotificationSettings />
         </Suspense>
       ) : (
-        <section aria-label="系统状态" className="status-grid">
-          <div className="panel status-card">
-            <h2>API 服务</h2>
-            <p role="status" data-state={live.status}>
-              {live.isPending
-                ? '正在检查'
-                : live.isSuccess
-                  ? '运行中'
-                  : '连接失败'}
-            </p>
-          </div>
-          <div className="panel status-card">
-            <h2>SQLite 数据库</h2>
-            <p role="status" data-state={ready.status}>
-              {ready.isPending
-                ? '正在检查'
-                : ready.isSuccess
-                  ? '就绪'
-                  : databaseStatus}
-            </p>
-          </div>
-        </section>
+        <>
+          <section aria-label="系统状态" className="status-grid">
+            <div className="panel status-card">
+              <h2>API 服务</h2>
+              <p role="status" data-state={live.status}>
+                {live.isPending
+                  ? '正在检查'
+                  : live.isSuccess
+                    ? '运行中'
+                    : '连接失败'}
+              </p>
+            </div>
+            <div className="panel status-card">
+              <h2>SQLite 数据库</h2>
+              <p role="status" data-state={ready.status}>
+                {ready.isPending
+                  ? '正在检查'
+                  : ready.isSuccess
+                    ? '就绪'
+                    : databaseStatus}
+              </p>
+            </div>
+          </section>
+          <Overview
+            onSignal={(id) => {
+              setHistoryCandidate(id);
+              setPage('history');
+            }}
+          />
+        </>
       )}
     </main>
+  );
+}
+
+function Overview({ onSignal }: { onSignal(id: string): void }) {
+  const overview = useQuery({
+    queryKey: ['overview'],
+    queryFn: () => request('/api/v1/overview', overviewResponseSchema.parse),
+    refetchInterval: 10_000,
+  });
+  if (overview.isPending) return <p role="status">正在读取统计和告警…</p>;
+  if (overview.isError)
+    return (
+      <p role="alert" className="error">
+        {overview.error.message}
+      </p>
+    );
+  const { data } = overview.data;
+  const time = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: data.timeZone,
+    dateStyle: 'short',
+    timeStyle: 'medium',
+  });
+  const stamp = (atMs: number | null) =>
+    atMs === null ? '暂无记录' : time.format(atMs);
+  const activeIds = new Set(data.system.active.map(({ id }) => id));
+  const alerts = [
+    ...data.system.active,
+    ...data.system.alerts.filter(({ id }) => !activeIds.has(id)),
+  ];
+  return (
+    <>
+      <section className="panel market-editor" aria-label="今日信号">
+        <h2>今日信号</h2>
+        <dl className="market-facts">
+          <div>
+            <dt>启用监控</dt>
+            <dd>{data.monitors}</dd>
+          </div>
+          <div>
+            <dt>候选</dt>
+            <dd>{data.candidates}</dd>
+          </div>
+          <div>
+            <dt>已送达</dt>
+            <dd>{data.sent}</dd>
+          </div>
+          <div>
+            <dt>已拒绝</dt>
+            <dd>{data.rejected}</dd>
+          </div>
+        </dl>
+        <h3>最近提醒</h3>
+        {data.recentSignals.length === 0 ? (
+          <p className="market-meta">暂无已送达的正式提醒。</p>
+        ) : (
+          <ul className="overview-list">
+            {data.recentSignals.map((signal) => (
+              <li key={signal.signalId}>
+                <button
+                  type="button"
+                  onClick={() => onSignal(signal.candidateId)}
+                >
+                  {signal.symbol}
+                </button>
+                <span>
+                  {signal.exchange === 'BITGET' ? 'Bitget' : 'Hyperliquid'} ·{' '}
+                  {stamp(signal.sentAtMs)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      <section className="panel market-editor" aria-label="告警与维护">
+        <h2>告警与维护</h2>
+        <dl className="market-facts">
+          <div>
+            <dt>未恢复告警</dt>
+            <dd>{data.system.active.length}</dd>
+          </div>
+          <div>
+            <dt>SQLite 占用</dt>
+            <dd>
+              {data.system.databaseBytes === null
+                ? '—'
+                : (data.system.databaseBytes / 1_048_576).toFixed(1) + ' MiB'}
+            </dd>
+          </div>
+          <div>
+            <dt>最近验证备份</dt>
+            <dd>{stamp(data.system.latestBackupAtMs)}</dd>
+          </div>
+          <div>
+            <dt>最近行情清理</dt>
+            <dd>{stamp(data.system.latestCleanupAtMs)}</dd>
+          </div>
+        </dl>
+        {alerts.length === 0 ? (
+          <p className="market-meta">暂无告警。</p>
+        ) : (
+          <ul className="overview-list">
+            {alerts.map((event) => (
+              <li key={event.id}>
+                <strong
+                  className={
+                    event.state === 'OPEN' && event.severity === 'ERROR'
+                      ? 'error'
+                      : undefined
+                  }
+                >
+                  {event.source} · {systemEventLabels[event.code] ?? event.code}
+                </strong>
+                <span>
+                  {stamp(event.createdAtMs)}
+                  {activeIds.has(event.id)
+                    ? ' · 告警中'
+                    : event.state === 'RECOVERED'
+                      ? ' · 已恢复'
+                      : ''}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </>
   );
 }
 

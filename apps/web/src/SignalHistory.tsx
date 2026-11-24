@@ -20,6 +20,12 @@ const path = '/api/v1/signals';
 const queryKey = ['signal-history'];
 const exchanges = { BITGET: 'Bitget', HYPERLIQUID: 'Hyperliquid' };
 const finalStates = { PASSED: '通过', REJECTED: '拒绝', SUPPRESSED: '抑制' };
+const preStates = {
+  PASSED: outcomes.PASSED,
+  REJECTED: outcomes.REJECTED,
+  SUPPRESSED: outcomes.SUPPRESSED,
+  WATCH_ONLY: outcomes.WATCH_ONLY,
+};
 const strategies = {
   'trend-pullback': '永续趋势回调',
   'spot-trend-pullback': '现货趋势回调',
@@ -33,11 +39,15 @@ function options(values: Record<string, string>) {
   ));
 }
 
-export function SignalHistory() {
+export function SignalHistory({
+  initialCandidateId,
+}: {
+  initialCandidateId: string | null;
+}) {
   const client = useQueryClient();
   const [filter, setFilter] = useState('');
   const [offset, setOffset] = useState(0);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState(initialCandidateId);
   const zone = useQuery({
     queryKey: [...queryKey, 'timezone'],
     queryFn: () =>
@@ -108,6 +118,7 @@ export function SignalHistory() {
       'q',
       'exchange',
       'strategyId',
+      'state',
       'finalState',
       'deliveryState',
       'theoryState',
@@ -157,6 +168,13 @@ export function SignalHistory() {
               <select name="strategyId">
                 <option value="">全部</option>
                 {options(strategies)}
+              </select>
+            </label>
+            <label>
+              预风控
+              <select name="state">
+                <option value="">全部</option>
+                {options(preStates)}
               </select>
             </label>
             <label>
@@ -393,6 +411,7 @@ export function SignalHistory() {
                   <th>交易所与策略</th>
                   <th>候选 / 批准 / 拒绝</th>
                   <th>已送达</th>
+                  <th>做多 / 做空</th>
                   <th>AI 接受 / 修改 / 拒绝</th>
                   <th>TP1–TP4 / SL</th>
                   <th>覆盖不足</th>
@@ -409,6 +428,9 @@ export function SignalHistory() {
                       {group.candidates} / {group.approved} / {group.rejected}
                     </td>
                     <td>{group.sent}</td>
+                    <td>
+                      {group.longs} / {group.shorts}
+                    </td>
                     <td>
                       {group.aiAccepted} / {group.aiModified} /{' '}
                       {group.aiRejected}

@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { loadEnvFile } from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { TIMEFRAMES } from '@market-sentinel/domain';
 
 const workspaceRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const envFile = resolve(workspaceRoot, '.env');
@@ -11,6 +12,11 @@ const secretSchema = z
   .string()
   .regex(/^[A-Za-z0-9+/]{43}=$/)
   .refine((value) => Buffer.from(value, 'base64').toString('base64') === value);
+
+const candleRetention = z.partialRecord(
+  z.enum(TIMEFRAMES),
+  z.number().int().min(1).max(3650),
+);
 
 const environmentSchema = z
   .object({
@@ -48,6 +54,15 @@ const environmentSchema = z
       (value) => (value === '' ? undefined : value),
       z.coerce.number().min(0).max(1000).optional(),
     ),
+    CANDLE_RETENTION_DAYS_BY_TIMEFRAME: z.preprocess((value) => {
+      if (value === undefined || value === '') return {};
+      try {
+        return JSON.parse(String(value)) as unknown;
+      } catch {
+        return value;
+      }
+    }, candleRetention),
+    OI_RETENTION_DAYS: z.coerce.number().int().min(2).max(3650).default(180),
     LOG_LEVEL: z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),

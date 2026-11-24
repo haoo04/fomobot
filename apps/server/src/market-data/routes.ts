@@ -20,6 +20,7 @@ import { ApiError, validated } from '../api-error.js';
 import { requireSession } from '../auth.js';
 import type { AppDatabase } from '../database.js';
 import type { Notifications } from '../notification/service.js';
+import type { Operations } from '../operations.js';
 import { auditLogs, monitorConfigs } from '../schema.js';
 import type { StrategyService } from '../strategy/service.js';
 import {
@@ -78,6 +79,7 @@ export function registerMarketRoutes(
   timeZone: string,
   notifications: Notifications,
   tracker: SignalTracker,
+  operations: Operations,
 ) {
   const actor = (request: FastifyRequest) =>
     requireSession(database, request).username;
@@ -419,6 +421,7 @@ export function registerMarketRoutes(
         timeZone,
         notifications: notifications.diagnostics(),
         ai: notifications.ai.usage(),
+        system: operations.diagnostics(),
       },
     };
   });

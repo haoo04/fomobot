@@ -30,6 +30,7 @@ export const telegramSettingsPatchSchema = z.strictObject({
   marketDailyLimit: dailyLimit,
   globalDailyLimit: dailyLimit,
   signalUpdatesEnabled: z.boolean().optional(),
+  systemAlertsEnabled: z.boolean().optional(),
 });
 
 const telegramSettingsSchema = telegramSettingsPatchSchema
@@ -43,6 +44,7 @@ const telegramSettingsSchema = telegramSettingsPatchSchema
     pairingError: z.string().nullable(),
     lastTest: deliverySchema.nullable(),
     signalUpdatesEnabled: z.boolean(),
+    systemAlertsEnabled: z.boolean(),
   });
 
 export const notificationDiagnosticsSchema = z.object({
@@ -50,6 +52,42 @@ export const notificationDiagnosticsSchema = z.object({
   deliveryUnknown: z.number().int().nonnegative(),
   lastQueueDelayMs: timestamp.nullable(),
 });
+
+export const systemEventLabels: Record<string, string> = {
+  WS_DISCONNECTED: '交易所 WebSocket 中断',
+  REST_FAILED: '交易所接口异常',
+  AI_CONFIGURATION: 'AI 配置异常',
+  AI_AUTH_FAILED: 'OpenAI 凭证异常',
+  AI_BUDGET_EXHAUSTED: 'AI 当日预算不足',
+  TELEGRAM_CREDENTIALS: 'Telegram 凭证异常',
+  DATABASE_UNAVAILABLE: 'SQLite 数据库不可用',
+  BACKUP_FAILED: '数据库备份失败',
+  BACKUP_VERIFIED: '数据库备份已验证',
+  RETENTION_FAILED: '行情清理失败',
+  RETENTION_COMPLETE: '行情清理完成',
+  RESTORED_DELIVERY_UNCERTAIN: '从备份恢复，原送达状态待确认',
+};
+
+const systemEventSchema = z.object({
+  id: z.number().int().positive(),
+  source: z.string(),
+  code: z.string(),
+  severity: z.enum(['INFO', 'WARN', 'ERROR']),
+  state: z.enum(['OPEN', 'RECOVERED', 'INFO']),
+  createdAtMs: timestamp,
+  detail: z.record(z.string(), z.union([z.string(), z.number()])),
+  delivery: deliverySchema.nullable(),
+});
+
+export const systemDiagnosticsSchema = z.object({
+  alerts: z.array(systemEventSchema),
+  active: z.array(systemEventSchema),
+  databaseBytes: timestamp.nullable(),
+  latestBackupAtMs: timestamp.nullable(),
+  latestCleanupAtMs: timestamp.nullable(),
+});
+
+export type SystemDiagnostics = z.infer<typeof systemDiagnosticsSchema>;
 
 export const telegramSettingsResponseSchema = z.object({
   requestId: z.string(),

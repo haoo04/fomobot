@@ -7,7 +7,7 @@ import type {
 } from '@market-sentinel/contracts';
 import Fastify from 'fastify';
 import { ApiError } from './api-error.js';
-import { registerAuthRoutes } from './auth.js';
+import { registerAuthRoutes, requireSession } from './auth.js';
 import type { AppConfig } from './config.js';
 import type { AppDatabase } from './database.js';
 import { registerMarketRoutes } from './market-data/routes.js';
@@ -15,6 +15,7 @@ import { createMarketData, type MarketData } from './market-data/service.js';
 import type { ReviewProvider } from './notification/ai.js';
 import { registerNotificationRoutes } from './notification/routes.js';
 import { createNotifications } from './notification/service.js';
+import { createOperations } from './operations.js';
 import { administrators } from './schema.js';
 import { createStrategyService } from './strategy/service.js';
 import { createSignalTracker } from './strategy/tracker.js';
@@ -126,6 +127,13 @@ export async function buildApp(
         'Signal tracking failed',
       ),
   );
+  const operations = createOperations(
+    database,
+    config,
+    marketData,
+    notifications,
+    (code) => app.log.error({ code }, 'Operations check failed'),
+  );
   await app.register(
     async (api) => {
       registerMarketRoutes(
@@ -136,8 +144,13 @@ export async function buildApp(
         config.APP_TIMEZONE,
         notifications,
         tracker,
+        operations,
       );
       registerNotificationRoutes(api, database, notifications);
+      api.get('/overview', async (request) => {
+        requireSession(database, request);
+        return { requestId: request.id, data: operations.overview() };
+      });
     },
     { prefix: '/api/v1' },
   );
@@ -145,10 +158,12 @@ export async function buildApp(
     notifications.start();
     strategies.start();
     tracker.start();
+    operations.start();
   });
   app.addHook('preClose', async () => {
     strategies.stop();
     tracker.stop();
+    await operations.stop();
     await notifications.stop();
     await marketData.stop();
   });
@@ -166,6 +181,7 @@ export async function buildApp(
         .limit(1)
         .get();
     } catch {
+      operations.databaseUnavailable();
       throw new ApiError(503, 'DATABASE_UNAVAILABLE', '数据库暂时不可用。');
     }
     return { status: 'ok', checks: { database: 'ok' }, requestId: request.id };

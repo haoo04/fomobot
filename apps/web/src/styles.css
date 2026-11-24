@@ -439,6 +439,27 @@ button:disabled {
   line-height: 1.65;
 }
 
+.overview-list {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.overview-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem 0.75rem;
+}
+
+.overview-list span {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
 .market-table {
   width: 100%;
   border-collapse: collapse;

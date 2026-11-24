@@ -145,6 +145,7 @@ export function createTelegram(
       marketDailyLimit: row?.marketDailyLimit ?? 8,
       globalDailyLimit: row?.globalDailyLimit ?? 30,
       signalUpdatesEnabled: row?.signalUpdatesEnabled ?? true,
+      systemAlertsEnabled: row?.systemAlertsEnabled ?? true,
     };
   }
 
@@ -157,6 +158,7 @@ export function createTelegram(
       marketDailyLimit,
       globalDailyLimit,
       signalUpdatesEnabled,
+      systemAlertsEnabled,
     } = current();
     const lastTest = pairing
       ? (db
@@ -184,6 +186,7 @@ export function createTelegram(
       marketDailyLimit,
       globalDailyLimit,
       signalUpdatesEnabled,
+      systemAlertsEnabled,
       lastTest,
     };
   }
@@ -208,6 +211,8 @@ export function createTelegram(
         globalDailyLimit: patch.globalDailyLimit,
         signalUpdatesEnabled:
           patch.signalUpdatesEnabled ?? row?.signalUpdatesEnabled ?? true,
+        systemAlertsEnabled:
+          patch.systemAlertsEnabled ?? row?.systemAlertsEnabled ?? true,
         ...(newFingerprint === fingerprint
           ? {}
           : {

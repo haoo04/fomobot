@@ -293,6 +293,9 @@ export const telegramSettings = sqliteTable(
     signalUpdatesEnabled: integer('signal_updates_enabled', { mode: 'boolean' })
       .notNull()
       .default(true),
+    systemAlertsEnabled: integer('system_alerts_enabled', { mode: 'boolean' })
+      .notNull()
+      .default(true),
   },
   (table) => [check('telegram_singleton', sql`${table.id} = 1`)],
 );
@@ -376,12 +379,37 @@ export const signalEvents = sqliteTable(
   ],
 );
 
+export const systemEvents = sqliteTable(
+  'system_events',
+  {
+    id: integer('id').primaryKey(),
+    source: text('source').notNull(),
+    code: text('code').notNull(),
+    state: text('state', { enum: ['OPEN', 'RECOVERED', 'INFO'] }).notNull(),
+    severity: text('severity', { enum: ['INFO', 'WARN', 'ERROR'] }).notNull(),
+    detail: text('detail_json', { mode: 'json' })
+      .$type<Record<string, string | number>>()
+      .notNull(),
+    createdAtMs: integer('created_at_ms').notNull(),
+    dedupeKey: text('dedupe_key').unique(),
+  },
+  (table) => [
+    index('system_events_recent').on(table.createdAtMs, table.id),
+    index('system_events_source_code').on(
+      table.source,
+      table.code,
+      table.createdAtMs,
+    ),
+  ],
+);
+
 export const outboxMessages = sqliteTable(
   'outbox_messages',
   {
     id: text('id').primaryKey(),
     dedupeKey: text('dedupe_key').notNull().unique(),
     signalId: text('signal_id').references(() => signals.id),
+    systemEventId: integer('system_event_id').references(() => systemEvents.id),
     kind: text('kind', {
       enum: ['TRADE_SIGNAL', 'TELEGRAM_TEST', 'SIGNAL_UPDATE', 'SYSTEM_ALERT'],
     })
@@ -408,7 +436,9 @@ export const outboxMessages = sqliteTable(
   (table) => [
     index('outbox_due').on(table.status, table.nextAttemptMs),
     index('outbox_signal').on(table.signalId),
+    index('outbox_system_event').on(table.systemEventId),
     index('outbox_send_day').on(table.sendDay),
+    index('outbox_sent_at').on(table.sentAtMs),
   ],
 );
 
