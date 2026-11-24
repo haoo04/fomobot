@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { AiReviewResult } from '@market-sentinel/contracts/notifications';
 import type {
   CandidateDirection,
   SignalQuery,
@@ -6,10 +7,11 @@ import type {
   StrategyTimeframes,
 } from '@market-sentinel/contracts/strategies';
 import type { Candle, MarketType } from '@market-sentinel/domain';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/sqlite-core';
 import type { AppDatabase } from '../database.js';
 import {
+  aiReviews,
   riskEvaluations,
   outboxMessages,
   signalCandidates,
@@ -18,6 +20,7 @@ import {
 } from '../schema.js';
 import type { MonitorRow } from '../market-data/store.js';
 import { deliveryFields } from '../notification/telegram.js';
+import { aiAudit } from '../notification/ai.js';
 import type { RiskResult } from './evaluate.js';
 
 type Store = Pick<AppDatabase, 'select' | 'insert'>;
@@ -138,6 +141,11 @@ const fields = {
   reasonCode: riskEvaluations.reasonCode,
   deliveryPending: signalCandidates.deliveryPending,
   signalId: signals.id,
+  signalMode: signals.mode,
+  aiDecision: sql<
+    AiReviewResult['decision'] | null
+  >`json_extract(${aiReviews.result}, '$.decision')`.as('ai_decision'),
+  aiStatus: aiReviews.status,
 };
 
 function deliveriesFor(db: AppDatabase, ids: string[]) {
@@ -172,6 +180,7 @@ export function listSignals(db: AppDatabase, query: SignalQuery) {
       ),
     )
     .leftJoin(signals, eq(signals.candidateId, signalCandidates.id))
+    .leftJoin(aiReviews, eq(aiReviews.candidateId, signalCandidates.id))
     .where(
       and(
         query.marketId
@@ -230,11 +239,24 @@ export function signalDetail(db: AppDatabase, id: string) {
       ),
     )
     .leftJoin(signals, eq(signals.candidateId, signalCandidates.id))
+    .leftJoin(aiReviews, eq(aiReviews.candidateId, signalCandidates.id))
     .where(eq(signalCandidates.id, id))
     .get();
   if (!row) return undefined;
   const deliveries = row.signalId ? deliveriesFor(db, [row.signalId]) : [];
-  return { ...row, delivery: deliveries[0] ?? null, deliveries };
+  const review = db
+    .select()
+    .from(aiReviews)
+    .where(eq(aiReviews.candidateId, id))
+    .get();
+  return {
+    ...row,
+    delivery: deliveries[0] ?? null,
+    deliveries,
+    aiReview: review
+      ? { ...aiAudit(review), requestSummary: review.requestSummary }
+      : null,
+  };
 }
 
 export function saveCandidates(

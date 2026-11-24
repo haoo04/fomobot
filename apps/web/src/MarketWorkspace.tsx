@@ -495,6 +495,10 @@ export function MarketWorkspace() {
                 秒
               </small>
             )}
+            <small>
+              今日 AI {diagnostics.data.data.ai.calls} 次 · 估算 USD{' '}
+              {diagnostics.data.data.ai.spentUsd.toFixed(6)}
+            </small>
           </div>
         )}
         {diagnostics.isPending && <p role="status">正在读取行情来源…</p>}

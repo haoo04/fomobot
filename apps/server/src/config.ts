@@ -37,6 +37,17 @@ const environmentSchema = z
     APP_ENCRYPTION_KEY_BASE64: secretSchema,
     SESSION_SECRET: secretSchema,
     TELEGRAM_BOT_TOKEN: z.string().trim().optional(),
+    OPENAI_API_KEY: z.string().trim().optional(),
+    OPENAI_MODEL: z.string().trim().optional(),
+    AI_REVIEW_ENABLED: z
+      .enum(['true', 'false'])
+      .optional()
+      .transform((value) => value === 'true'),
+    AI_FAIL_POLICY: z.literal('FAIL_CLOSED').optional(),
+    AI_DAILY_BUDGET_USD: z.preprocess(
+      (value) => (value === '' ? undefined : value),
+      z.coerce.number().min(0).max(1000).optional(),
+    ),
     LOG_LEVEL: z
       .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
       .default('info'),

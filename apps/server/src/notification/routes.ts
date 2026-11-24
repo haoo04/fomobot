@@ -1,4 +1,7 @@
-import { telegramSettingsPatchSchema } from '@market-sentinel/contracts/notifications';
+import {
+  aiSettingsPatchSchema,
+  telegramSettingsPatchSchema,
+} from '@market-sentinel/contracts/notifications';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { validated } from '../api-error.js';
@@ -47,5 +50,20 @@ export function registerNotificationRoutes(
     validated(resendSchema, request.body);
     service.resend(id, username);
     return reply.code(202).send({ requestId: request.id });
+  });
+  app.get('/settings/ai', async (request) => {
+    actor(request);
+    return { requestId: request.id, data: service.ai.settings() };
+  });
+  app.put('/settings/ai', async (request) => {
+    const username = actor(request);
+    const patch = validated(aiSettingsPatchSchema, request.body);
+    return { requestId: request.id, data: service.ai.save(patch, username) };
+  });
+  app.post('/settings/ai/test', sensitiveAction, async (request) => {
+    return {
+      requestId: request.id,
+      data: await service.testAi(actor(request)),
+    };
   });
 }

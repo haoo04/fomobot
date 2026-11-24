@@ -373,7 +373,7 @@ export function evaluateRisk(
   const takeProfits: RiskLevels['takeProfits'] = [];
   let weightedMove = new Exact(0);
   let previous = entry;
-  const targets =
+  const targets: RiskLevels['takeProfits'] =
     proposal?.takeProfits ??
     risk.takeProfits.map((target) => {
       const move = distance.times(target.rMultiple);
@@ -403,10 +403,11 @@ export function evaluateRisk(
       (long ? rounded.lte(previous) : rounded.gte(previous))
     )
       return reject('REJECT_INVALID_TARGET');
-    takeProfits.push({ price: rounded.toFixed(), closePct: target.closePct });
-    weightedMove = weightedMove.plus(
-      rounded.minus(entry).abs().times(target.closePct),
-    );
+    takeProfits.push({ ...target, price: rounded.toFixed() });
+    if (!target.trailPolicy || target.trailPolicy === 'NONE')
+      weightedMove = weightedMove.plus(
+        rounded.minus(entry).abs().times(target.closePct),
+      );
     previous = rounded;
   }
   const weightedRR = weightedMove.div(distance.times(100));

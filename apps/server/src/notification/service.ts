@@ -19,28 +19,54 @@ import {
 } from '../schema.js';
 import { evaluateRisk, reject, type RiskResult } from '../strategy/evaluate.js';
 import { signalDetail } from '../strategy/store.js';
+import { createAiReview, type ReviewProvider } from './ai.js';
 import { createTelegram } from './telegram.js';
 
 type Candidate = NonNullable<ReturnType<typeof signalDetail>>;
 type Outbox = typeof outboxMessages.$inferSelect;
 type MarketSource = Pick<MarketData, 'now' | 'view' | 'strategyMarket'>;
 const countedDeliveries = ['SENDING', 'SENT', 'DELIVERY_UNKNOWN'] as const;
+const closedBarSummary = z.object({
+  open: price.optional(),
+  close: price,
+  high: price,
+  low: price,
+  baseVolume: decimal,
+  quoteTurnover: decimal.nullable(),
+  closeTimeMs: z.number().int().nonnegative().optional(),
+});
 const snapshotSchema = z.object({
   candles: z.object({
     trigger: z.object({
-      last: z.object({
-        close: price,
-        high: price,
-        low: price,
-        baseVolume: decimal,
-        quoteTurnover: decimal.nullable(),
-      }),
+      last: closedBarSummary,
+      previous: closedBarSummary.optional(),
     }),
+    confirm: z.object({ last: closedBarSummary }).optional(),
+    trend: z.object({ last: closedBarSummary }).optional(),
   }),
-  indicators: z.object({ atr: z.number().positive() }),
+  indicators: z.object({
+    atr: z.number().positive(),
+    triggerEma: z.number().optional(),
+    trendEma: z.array(z.number()).max(3).optional(),
+    rsi: z.number().optional(),
+    previousRsi: z.number().optional(),
+    rvol: z.number().optional(),
+  }),
   openInterest: z
     .object({
-      latest: z.object({ timestampMs: z.number().int().nonnegative() }),
+      latest: z.object({
+        timestampMs: z.number().int().nonnegative(),
+        value: decimal.optional(),
+        unit: z
+          .enum(['BASE_ASSET', 'CONTRACTS', 'USD_NOTIONAL', 'OTHER'])
+          .optional(),
+      }),
+      reference: z
+        .object({
+          timestampMs: z.number().int().nonnegative(),
+          value: decimal.optional(),
+        })
+        .optional(),
       deltaPct: z.number(),
     })
     .nullable(),
@@ -53,15 +79,53 @@ function suppressed(
   return { outcome: 'SUPPRESSED', reasonCode, levels };
 }
 
+function coolingDown(
+  store: Pick<AppDatabase, 'select'>,
+  candidate: Candidate,
+  atMs: number,
+) {
+  const cooldown = candidate.params.risk.cooldownMinutes * 60_000;
+  if (cooldown === 0) return false;
+  const recent = store
+    .select({ id: signals.id })
+    .from(signals)
+    .innerJoin(signalCandidates, eq(signalCandidates.id, signals.candidateId))
+    .innerJoin(
+      strategyConfigVersions,
+      eq(strategyConfigVersions.id, signalCandidates.configVersionId),
+    )
+    .innerJoin(outboxMessages, eq(outboxMessages.signalId, signals.id))
+    .where(
+      and(
+        eq(signalCandidates.marketId, candidate.marketId),
+        eq(signalCandidates.direction, candidate.direction),
+        eq(strategyConfigVersions.strategyId, candidate.strategyId),
+        gt(
+          signalCandidates.triggerCloseMs,
+          candidate.triggerCloseMs - cooldown,
+        ),
+        or(
+          inArray(outboxMessages.status, ['SENT', 'DELIVERY_UNKNOWN']),
+          and(
+            inArray(outboxMessages.status, ['PENDING', 'SENDING']),
+            gt(outboxMessages.expiresAtMs, atMs),
+          ),
+        ),
+      ),
+    )
+    .get();
+  return !!recent;
+}
+
 export function createNotifications(
   db: AppDatabase,
   config: AppConfig,
   marketData: MarketSource,
   onError: () => void,
-  fetchTelegram?: typeof fetch,
+  options: { fetchTelegram?: typeof fetch; reviewOpenAI?: ReviewProvider } = {},
 ) {
   const { now } = marketData;
-  const telegram = createTelegram(db, config, now, fetchTelegram);
+  const telegram = createTelegram(db, config, now, options.fetchTelegram);
   const day = new Intl.DateTimeFormat('en-CA', {
     timeZone: config.APP_TIMEZONE,
     year: 'numeric',
@@ -73,6 +137,7 @@ export function createNotifications(
     dateStyle: 'short',
     timeStyle: 'medium',
   });
+  const ai = createAiReview(db, config, now, day, options.reviewOpenAI);
   const lifecycle = new AbortController();
   const tasks = new Map<() => Promise<void> | void, Promise<void>>();
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -140,7 +205,9 @@ export function createNotifications(
     return { risk, quote, market, snapshot: snapshot.data };
   }
 
-  function tickSignals() {
+  async function tickSignals() {
+    if (lifecycle.signal.aborted) return;
+    ai.recover();
     const next = db
       .select({ id: signalCandidates.id })
       .from(signalCandidates)
@@ -149,48 +216,100 @@ export function createNotifications(
       .get();
     if (!next) return;
     const candidate = signalDetail(db, next.id)!;
-    const atMs = now();
     const { pairing } = telegram.current();
-    const result = check(candidate, candidate.levels!, atMs);
+    let result = check(candidate, candidate.levels!, now());
     let risk = result.risk;
     if (risk.outcome === 'PASSED' && !pairing)
       risk = suppressed('SUPPRESS_TELEGRAM_NOT_PAIRED', risk.levels);
-    db.transaction((tx) => {
-      const cooldown = candidate.params.risk.cooldownMinutes * 60_000;
-      if (risk.outcome === 'PASSED' && cooldown > 0) {
-        const recent = tx
-          .select({ id: signals.id })
-          .from(signals)
-          .innerJoin(
-            signalCandidates,
-            eq(signalCandidates.id, signals.candidateId),
-          )
-          .innerJoin(
-            strategyConfigVersions,
-            eq(strategyConfigVersions.id, signalCandidates.configVersionId),
-          )
-          .innerJoin(outboxMessages, eq(outboxMessages.signalId, signals.id))
-          .where(
-            and(
-              eq(signalCandidates.marketId, candidate.marketId),
-              eq(signalCandidates.direction, candidate.direction),
-              eq(strategyConfigVersions.strategyId, candidate.strategyId),
-              gt(
-                signalCandidates.triggerCloseMs,
-                candidate.triggerCloseMs - cooldown,
-              ),
-              or(
-                inArray(outboxMessages.status, ['SENT', 'DELIVERY_UNKNOWN']),
-                and(
-                  inArray(outboxMessages.status, ['PENDING', 'SENDING']),
-                  gt(outboxMessages.expiresAtMs, atMs),
-                ),
-              ),
-            ),
-          )
-          .get();
-        if (recent) risk = suppressed('SUPPRESS_COOLDOWN', risk.levels);
+    if (
+      risk.outcome === 'PASSED' &&
+      ai.current().enabled &&
+      coolingDown(db, candidate, now())
+    )
+      risk = suppressed('SUPPRESS_COOLDOWN', risk.levels);
+    const expiresAtMs =
+      candidate.triggerCloseMs + candidate.params.risk.maxAgeSeconds * 1000;
+    let review = ai.find(candidate.id);
+    if (
+      risk.outcome === 'PASSED' &&
+      pairing &&
+      (review || ai.current().enabled)
+    ) {
+      const { market, snapshot, quote } = result;
+      review ??= await ai.review(
+        {
+          market: {
+            exchange: market!.exchange,
+            type: market!.marketType,
+            product: market!.productType.slice(0, 128),
+            venue: market!.venue.slice(0, 128),
+            symbol: market!.nativeSymbol.slice(0, 128),
+            isRwa: market!.isRwa,
+            isReality: market!.isReality,
+          },
+          strategy: candidate.strategyId,
+          strategyVersion: candidate.strategyVersion,
+          direction: candidate.direction,
+          timeframes: candidate.timeframes,
+          clock: {
+            triggerCloseMs: candidate.triggerCloseMs,
+            evaluatedAtMs: candidate.evaluatedAtMs,
+          },
+          evidence: snapshot,
+          quote,
+          proposal: candidate.levels,
+          riskLimits: candidate.params.risk,
+        },
+        lifecycle.signal,
+        { id: candidate.id, pairingId: pairing.id, expiresAtMs },
+      );
+      if (review.status === 'RUNNING') return;
+      if (review.reasonCode || !review.result)
+        risk = reject(review.reasonCode ?? 'AI_INVALID_OUTPUT');
+      else if (ai.current().revision !== review.settingsRevision)
+        risk = suppressed('SUPPRESS_AI_SETTINGS_CHANGED');
+      else if (
+        review.pairingId !== pairing.id ||
+        telegram.current().pairing?.id !== pairing.id
+      )
+        risk = suppressed('TELEGRAM_PAIRING_CHANGED');
+      else {
+        const proposal = candidate.levels!;
+        const change = review.result.levelAdjustment;
+        const levels = change
+          ? {
+              ...proposal,
+              stop: change.stopPrice ?? proposal.stop,
+              takeProfits: change.takeProfits.length
+                ? change.takeProfits.map((target) => ({
+                    price: target.targetPrice,
+                    closePct: target.closePct,
+                    ...(target.trailPolicy === 'NONE'
+                      ? {}
+                      : { trailPolicy: target.trailPolicy }),
+                  }))
+                : proposal.takeProfits,
+            }
+          : proposal;
+        result = check(candidate, levels, now());
+        risk = result.risk;
       }
+    }
+    const atMs = now();
+    db.transaction((tx) => {
+      const claimed = tx
+        .update(signalCandidates)
+        .set({ deliveryPending: false })
+        .where(
+          and(
+            eq(signalCandidates.id, candidate.id),
+            eq(signalCandidates.deliveryPending, true),
+          ),
+        )
+        .run();
+      if (!claimed.changes) return;
+      if (risk.outcome === 'PASSED' && coolingDown(tx, candidate, atMs))
+        risk = suppressed('SUPPRESS_COOLDOWN', risk.levels);
       tx.insert(riskEvaluations)
         .values({
           candidateId: candidate.id,
@@ -200,10 +319,6 @@ export function createNotifications(
           quote: result.quote,
         })
         .run();
-      tx.update(signalCandidates)
-        .set({ deliveryPending: false })
-        .where(eq(signalCandidates.id, candidate.id))
-        .run();
       if (
         risk.outcome !== 'PASSED' ||
         !risk.levels ||
@@ -212,8 +327,6 @@ export function createNotifications(
       )
         return;
       const id = randomUUID();
-      const expiresAtMs =
-        candidate.triggerCloseMs + candidate.params.risk.maxAgeSeconds * 1000;
       const { entry, stop, takeProfits, weightedRR } = risk.levels;
       const {
         exchange,
@@ -231,7 +344,8 @@ export function createNotifications(
           : '趋势 EMA 空头排列，确认周期 RSI 回落，触发周期放量') +
         (candidate.params.breakPreviousCandle ? (long ? '突破' : '跌破') : '');
       const body = [
-        '[规则信号] ' + (long ? '做多 LONG' : '做空 SHORT'),
+        (review ? '[AI 审核通过] ' : '[规则信号] ') +
+          (long ? '做多 LONG' : '做空 SHORT'),
         '时间 ' +
           displayTime.format(candidate.triggerCloseMs) +
           ' (' +
@@ -270,6 +384,28 @@ export function createNotifications(
         ),
         '加权 R:R ' + weightedRR,
         '理由 ' + reasons + (candidate.params.oi ? '，OI 达到策略阈值' : ''),
+        ...(review?.result
+          ? [
+              'AI 决策 ' +
+                review.result.decision +
+                ' · 主观评分 ' +
+                review.result.confidenceScore +
+                '/100',
+              ...review.result.rationale.map((reason) => '审核理由 ' + reason),
+              ...review.result.riskFlags.map((flag) => 'AI 风险 ' + flag),
+            ]
+          : []),
+        ...takeProfits.flatMap((target, index) =>
+          target.trailPolicy === 'BREAKEVEN_AFTER_TP1'
+            ? ['TP' + (index + 1) + ' 管理建议 TP1 后移至保本']
+            : target.trailPolicy === 'ATR_TRAIL_AFTER_TP1'
+              ? [
+                  'TP' +
+                    (index + 1) +
+                    ' 管理建议 TP1 后按触发周期 1.5×ATR 移动止损',
+                ]
+              : [],
+        ),
         ...(isRwa || isReality
           ? ['风险 参考市场休市时可能出现流动性和基差变化。']
           : []),
@@ -283,6 +419,8 @@ export function createNotifications(
           levels: risk.levels,
           approvedAtMs: atMs,
           expiresAtMs,
+          mode: review ? 'AI_REVIEW' : 'RULE_ONLY',
+          aiRevision: review?.settingsRevision ?? null,
         })
         .run();
       tx.insert(outboxMessages)
@@ -358,8 +496,12 @@ export function createNotifications(
           .where(eq(signals.id, pending.signalId))
           .get()!;
         const candidate = signalDetail(db, signal.candidateId)!;
-        const { risk } = check(candidate, signal.levels, atMs);
-        reason = risk.reasonCode;
+        const currentAi = ai.current();
+        reason =
+          currentAi.enabled !== (signal.mode === 'AI_REVIEW') ||
+          (signal.aiRevision && currentAi.revision !== signal.aiRevision)
+            ? 'SUPPRESS_AI_SETTINGS_CHANGED'
+            : check(candidate, signal.levels, atMs).risk.reasonCode;
         if (!reason) {
           const counts = tx
             .select({ marketId: signalCandidates.marketId, total: count() })
@@ -585,6 +727,29 @@ export function createNotifications(
     };
   }
 
+  async function testAi(actor: string) {
+    await ai.review(
+      {
+        purpose: 'connection_test',
+        direction: 'LONG',
+        market: { symbol: 'TEST', type: 'SPOT' },
+        proposal: {
+          entry: '100',
+          stop: '98',
+          takeProfits: [
+            { price: '103', closePct: 50 },
+            { price: '106', closePct: 50 },
+          ],
+          weightedRR: '2.25',
+        },
+      },
+      lifecycle.signal,
+      undefined,
+      actor,
+    );
+    return ai.settings();
+  }
+
   const tickPair = () => telegram.poll(lifecycle.signal);
   function schedule(task: () => Promise<void> | void) {
     if (tasks.has(task)) return;
@@ -598,6 +763,8 @@ export function createNotifications(
   }
   return {
     telegram,
+    ai,
+    testAi,
     enqueueTest,
     resend,
     diagnostics,

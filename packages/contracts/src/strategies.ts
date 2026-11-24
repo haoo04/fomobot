@@ -1,7 +1,12 @@
 import { MARKET_TYPES } from '@market-sentinel/domain';
 import { z } from 'zod';
 import { timeframeSchema } from './index.js';
-import { deliverySchema } from './notifications.js';
+import {
+  aiReviewAuditSchema,
+  aiReviewStatusSchema,
+  deliverySchema,
+  trailPolicySchema,
+} from './notifications.js';
 
 const percent = z.number().min(0).max(100);
 const periods = z.number().int().min(1);
@@ -149,13 +154,22 @@ const candidateSchema = versionSchema.extend({
   deliveryPending: z.boolean(),
   finalRisk: reviewSchema.nullable(),
   signalId: z.uuid().nullable(),
+  signalMode: z.enum(['RULE_ONLY', 'AI_REVIEW']).nullable(),
+  aiDecision: z.enum(['ACCEPT', 'REJECT', 'MODIFY']).nullable(),
+  aiStatus: aiReviewStatusSchema.nullable(),
   delivery: deliverySchema.nullable(),
 });
 
 const riskLevelsSchema = z.object({
   entry: priceText,
   stop: priceText,
-  takeProfits: z.array(z.object({ price: priceText, closePct: percent })),
+  takeProfits: z.array(
+    z.object({
+      price: priceText,
+      closePct: percent,
+      trailPolicy: trailPolicySchema.optional(),
+    }),
+  ),
   weightedRR: priceText,
 });
 
@@ -189,10 +203,16 @@ export const signalResponseSchema = response(
       .extend({
         levels: riskLevelsSchema.nullable(),
         atMs: timestamp.nullable(),
+        quote: z.record(z.string(), z.unknown()).nullable(),
       })
       .nullable(),
     deliveries: z.array(deliverySchema),
     canResend: z.boolean(),
+    aiReview: aiReviewAuditSchema
+      .extend({
+        requestSummary: z.record(z.string(), z.unknown()),
+      })
+      .nullable(),
     evidence: z.record(z.string(), z.unknown()),
   }),
 );

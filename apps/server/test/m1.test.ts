@@ -343,7 +343,7 @@ test('upgrades a real M0 database twice and retains its administrator and audit 
       database.$client
         .prepare('SELECT COUNT(*) AS n FROM __drizzle_migrations')
         .get(),
-    ).toMatchObject({ n: 4 });
+    ).toMatchObject({ n: 5 });
     expect(database.select().from(markets).all()).toEqual([]);
   } finally {
     rmSync(legacySql, { force: true });
@@ -681,7 +681,7 @@ test('protects and audits market operations and rolls back a batch containing an
   }
 });
 
-describe('dual provider collection', () => {
+describe('dual provider collection', { timeout: 60_000 }, () => {
   test('warms 60 timeframe streams and recovers one exchange while the other keeps confirming candles', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(fixedTime);

@@ -11,7 +11,7 @@ import {
   secretStore,
   telegramSettings,
 } from '../schema.js';
-import { readSecret, saveSecret } from '../secrets.js';
+import { maskSecret, readSecret, saveSecret } from '../secrets.js';
 
 const botSchema = z.object({ username: z.string().regex(/^\w{1,64}$/) });
 const telegramId = z.number().int().refine(Number.isSafeInteger);
@@ -164,7 +164,7 @@ export function createTelegram(
           .get() ?? null)
       : null;
     return {
-      tokenMask: token ? '••••' + token.slice(-4) : null,
+      tokenMask: maskSecret(token),
       storedToken: !!row?.tokenRef,
       botUsername: binding?.botUsername ?? null,
       paired: !!pairing,

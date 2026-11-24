@@ -12,8 +12,10 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Market, MarketQuote } from '@market-sentinel/contracts/markets';
 import {
+  aiSettingsResponseSchema,
   telegramPairResponseSchema,
   telegramSettingsResponseSchema,
+  type AiReviewResult,
 } from '@market-sentinel/contracts/notifications';
 import { eq } from 'drizzle-orm';
 import { migrate } from 'drizzle-orm/node-sqlite/migrator';
@@ -27,8 +29,10 @@ import {
   type AppDatabase,
 } from '../src/database.js';
 import { createMarketData } from '../src/market-data/service.js';
+import type { ReviewProvider } from '../src/notification/ai.js';
 import { createNotifications } from '../src/notification/service.js';
 import {
+  aiReviews,
   markets,
   monitorConfigs,
   outboxMessages,
@@ -46,6 +50,7 @@ import {
 const closeTime = Date.UTC(2026, 10, 24, 12);
 const timeframes = { trigger: '3m', confirm: '5m', trend: '1h' } as const;
 const token = '345678:fixture_bot_token';
+const aiKey = 'sk-fixture-key-abc1';
 const actor = 'fixture-admin';
 const chatId = 23456789012;
 let db: AppDatabase;
@@ -265,18 +270,51 @@ async function paired(
   market = marketFixture(),
   settings = config({ TELEGRAM_BOT_TOKEN: token }),
   fake = fakeTelegram(),
+  reviewOpenAI?: ReviewProvider,
 ) {
   const queue = createNotifications(
     db,
     settings,
     market.data,
     () => undefined,
-    fake.transport,
+    { fetchTelegram: fake.transport, reviewOpenAI },
   );
   const challenge = await queue.telegram.pair(actor);
   fake.update(challenge.code);
   await queue.tickPair();
   return { queue, fake, market, settings };
+}
+
+function reviewResponse(choices: Partial<AiReviewResult> = {}) {
+  const review: AiReviewResult = {
+    decision: 'ACCEPT',
+    confidenceScore: 85,
+    rationale: ['固定行情审核样本'],
+    riskFlags: [],
+    rejectReason: null,
+    levelAdjustment: null,
+    ...choices,
+  };
+  return {
+    status: 'completed',
+    model: 'gpt-6-luna-fixture',
+    output: [
+      {
+        type: 'message',
+        content: [{ type: 'output_text', text: JSON.stringify(review) }],
+      },
+    ],
+    usage: { input_tokens: 320, output_tokens: 80 },
+  };
+}
+
+function aiConfig(budget = '1') {
+  return config({
+    TELEGRAM_BOT_TOKEN: token,
+    OPENAI_API_KEY: aiKey,
+    AI_REVIEW_ENABLED: 'true',
+    AI_DAILY_BUDGET_USD: budget,
+  });
 }
 
 test('pairs only one private chat with a fresh code and stores and exposes only masked credentials', async () => {
@@ -288,7 +326,7 @@ test('pairs only one private chat with a fresh code and stores and exposes only 
     config(),
     market.data,
     () => undefined,
-    fake.transport,
+    { fetchTelegram: fake.transport },
   );
   const saved = queue.telegram.save(
     { botToken: token, marketDailyLimit: 8, globalDailyLimit: 30 },
@@ -346,15 +384,17 @@ test('finalizes rule signals atomically and suppresses a subsequent candidate on
   db.$client.exec(
     "CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox_messages BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END",
   );
-  expect(() => queue.tickSignals()).toThrow('insert into "outbox_messages"');
+  await expect(queue.tickSignals()).rejects.toThrow(
+    'insert into "outbox_messages"',
+  );
   expect(db.select().from(signals).all()).toHaveLength(0);
   expect(signalDetail(db, id)).toMatchObject({
     deliveryPending: true,
     finalRisk: null,
   });
   db.$client.exec('DROP TRIGGER fail_outbox');
-  queue.tickSignals();
-  queue.tickSignals();
+  await queue.tickSignals();
+  await queue.tickSignals();
   await queue.tickOutbox();
   expect(fake.sent).toHaveLength(1);
   expect(fake.sent[0]?.text).toMatch(/\[规则信号\].*LONG/s);
@@ -370,7 +410,7 @@ test('finalizes rule signals atomically and suppresses a subsequent candidate on
   expect(queue.diagnostics().lastQueueDelayMs).toBe(5000);
   clock += 180_000;
   const second = market.candidate(closeTime + 180_000);
-  queue.tickSignals();
+  await queue.tickSignals();
   expect(signalDetail(db, second)?.finalRisk).toMatchObject({
     outcome: 'SUPPRESSED',
     reasonCode: 'SUPPRESS_COOLDOWN',
@@ -389,7 +429,7 @@ test('defers Telegram throttles, then stops automatic retries when delivery beco
       ),
     )
     .mockRejectedValueOnce(new Error('fixture timeout'));
-  queue.tickSignals();
+  await queue.tickSignals();
   await queue.tickOutbox();
   clock += 7999;
   await queue.tickOutbox();
@@ -427,7 +467,7 @@ test.each([
     migrateDatabase(db);
     const { queue, fake, market, settings } = await paired();
     const id = market.candidate();
-    queue.tickSignals();
+    await queue.tickSignals();
     const reason = {
       paused: 'SUPPRESS_MONITOR_CHANGED',
       'new pairing': 'TELEGRAM_PAIRING_CHANGED',
@@ -441,7 +481,7 @@ test.each([
       await queue.tickOutbox();
       clock += 180_000;
       const second = market.candidate(closeTime + 180_000);
-      queue.tickSignals();
+      await queue.tickSignals();
       await queue.tickOutbox();
       expect(signalDetail(db, second)?.delivery).toMatchObject({
         status: 'FAILED',
@@ -469,7 +509,7 @@ test.each([
         settings,
         market.data,
         () => undefined,
-        fake.transport,
+        { fetchTelegram: fake.transport },
       );
       await restarted.tickOutbox();
     } else await queue.tickOutbox();
@@ -485,7 +525,7 @@ test('rechecks new book drift and the original OI sample before approval', async
   migrateDatabase(db);
   const { queue, market } = await paired(marketFixture({ marketType: 'PERP' }));
   const id = market.candidate(closeTime, 178_000);
-  queue.tickSignals();
+  await queue.tickSignals();
   expect(signalDetail(db, id)?.finalRisk?.reasonCode).toBe(
     'REJECT_OI_UNAVAILABLE',
   );
@@ -497,7 +537,7 @@ test('rechecks new book drift and the original OI sample before approval', async
     bid: { ...quote.bid, value: '103' },
     ask: { ...quote.ask, value: '103.02' },
   });
-  queue.tickSignals();
+  await queue.tickSignals();
   expect(signalDetail(db, next)?.finalRisk?.reasonCode).toBe(
     'REJECT_PRICE_DRIFT',
   );
@@ -551,7 +591,7 @@ test('preserves M2 candidate history without enqueueing a notification after mig
       },
       () => undefined,
     );
-    queue.tickSignals();
+    await queue.tickSignals();
     expect(signalDetail(db, legacyId)).toMatchObject({
       deliveryPending: false,
       signalId: null,
@@ -567,12 +607,14 @@ test('preserves M2 candidate history without enqueueing a notification after mig
   }
 });
 
-test('authenticates Telegram settings and validates origin before provider actions', async () => {
+test('authenticates settings and validates origin before Telegram and OpenAI provider actions', async () => {
   migrateDatabase(db);
   const settings = config();
   const fake = fakeTelegram();
+  const reviewer = vi.fn<ReviewProvider>(async () => reviewResponse());
   const app = await buildApp(db, settings, createMarketData(db), {
     fetchTelegram: fake.transport,
+    reviewOpenAI: reviewer,
   });
   const path = '/api/v1/settings/telegram';
   try {
@@ -583,6 +625,7 @@ test('authenticates Telegram settings and validates origin before provider actio
     await initializeAdministrator(db, credentials);
     const head = { origin: settings.WEB_ORIGIN };
     expect((await app.inject(path)).statusCode).toBe(401);
+    expect((await app.inject('/api/v1/settings/ai')).statusCode).toBe(401);
     const login = await app.inject({
       url: '/api/v1/auth/login',
       method: 'POST',
@@ -629,7 +672,345 @@ test('authenticates Telegram settings and validates origin before provider actio
         })
       ).statusCode,
     ).toBe(409);
+    const aiPath = '/api/v1/settings/ai';
+    const aiPatch = {
+      apiKey: aiKey,
+      enabled: false,
+      model: 'gpt-6-luna',
+      confidenceThreshold: 70,
+      dailyBudgetUsd: 1,
+      timeoutMs: 10_000,
+      maxOutputTokens: 1024,
+    };
+    expect(
+      (await app.inject({ method: 'POST', url: aiPath + '/test', cookies }))
+        .statusCode,
+    ).toBe(403);
+    const saveAi = await app.inject({
+      method: 'PUT',
+      url: aiPath,
+      headers: head,
+      cookies,
+      payload: aiPatch,
+    });
+    expect(saveAi.statusCode).toBe(200);
+    expect(aiSettingsResponseSchema.parse(saveAi.json()).data.apiKeyMask).toBe(
+      '••••abc1',
+    );
+    expect(saveAi.body).not.toContain(aiKey);
+    const tested = await app.inject({
+      method: 'POST',
+      url: aiPath + '/test',
+      headers: head,
+      cookies,
+    });
+    expect(aiSettingsResponseSchema.parse(tested.json()).data).toMatchObject({
+      enabled: false,
+      lastTest: { status: 'COMPLETED', inputTokens: 320, outputTokens: 80 },
+      usage: { calls: 1, spentUsd: 0.00008, reservedUsd: 0 },
+    });
+    expect(reviewer).toHaveBeenCalledTimes(1);
+    expect(fake.sent).toHaveLength(0);
+    expect(db.select().from(signals).all()).toHaveLength(0);
   } finally {
     await app.close();
   }
+});
+
+test.each(['ACCEPT', 'MODIFY'] as const)(
+  'audits one AI %s, finalizes the priced plan and sends it',
+  async (decision) => {
+    migrateDatabase(db);
+    const levelAdjustment =
+      decision === 'MODIFY'
+        ? ({
+            stopPrice: '99.02',
+            takeProfits: [
+              {
+                targetPrice: '104.02',
+                closePct: 60,
+                management: 'FIXED',
+                trailPolicy: 'NONE',
+              },
+              {
+                targetPrice: '106.02',
+                closePct: 40,
+                management: 'TRAIL_AFTER_TRIGGER',
+                trailPolicy: 'BREAKEVEN_AFTER_TP1',
+              },
+            ],
+          } as const)
+        : null;
+    const reviewer = vi.fn<ReviewProvider>(async (request) => {
+      expect(request).toMatchObject({
+        model: 'gpt-6-luna',
+        store: false,
+        max_output_tokens: 1024,
+        text: {
+          format: {
+            type: 'json_schema',
+            strict: true,
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+            },
+          },
+        },
+      });
+      expect(request.input).not.toContain(token);
+      expect(request.input).not.toContain(aiKey);
+      return reviewResponse({
+        decision,
+        levelAdjustment: levelAdjustment
+          ? {
+              ...levelAdjustment,
+              takeProfits: [...levelAdjustment.takeProfits],
+            }
+          : null,
+      });
+    });
+    const { queue, fake, market } = await paired(
+      marketFixture(),
+      aiConfig(),
+      fakeTelegram(),
+      reviewer,
+    );
+    const id = market.candidate();
+    await Promise.all([queue.tickSignals(), queue.tickSignals()]);
+    market.candidate();
+    await queue.tickSignals();
+    await queue.tickOutbox();
+    expect(reviewer).toHaveBeenCalledTimes(1);
+    expect(signalDetail(db, id)).toMatchObject({
+      signalMode: 'AI_REVIEW',
+      aiDecision: decision,
+      aiReview: {
+        status: 'COMPLETED',
+        result: { decision },
+        inputTokens: 320,
+        outputTokens: 80,
+        costUsd: 0.00008,
+        requestSummary: { direction: 'LONG', market: { symbol: 'FIXUSDT' } },
+      },
+      finalRisk: {
+        outcome: 'PASSED',
+        levels: {
+          entry: '100.02',
+          stop: decision === 'ACCEPT' ? '98.02' : '99.02',
+          weightedRR: decision === 'ACCEPT' ? '2.25' : '2.4',
+        },
+      },
+      delivery: { status: 'SENT', telegramMessageId: '17' },
+    });
+    expect(fake.sent).toHaveLength(1);
+    expect(fake.sent[0]?.text).toContain('[AI 审核通过]');
+    expect(fake.sent[0]?.text).toContain(decision);
+    if (decision === 'MODIFY')
+      expect(fake.sent[0]?.text).toContain('TP1 后移至保本');
+    expect(queue.ai.usage()).toMatchObject({ calls: 1, reservedUsd: 0 });
+  },
+);
+
+test.each([
+  ['reject', 'AI_REJECTED'],
+  ['low confidence', 'AI_LOW_CONFIDENCE'],
+  ['bad output', 'AI_INVALID_OUTPUT'],
+  ['refusal', 'AI_MODEL_REFUSAL'],
+  ['incomplete', 'AI_INCOMPLETE'],
+  ['timeout', 'AI_TIMEOUT'],
+  ['budget', 'AI_BUDGET_EXHAUSTED'],
+  ['weak R:R', 'REJECT_LOW_RR'],
+  ['invalid price', 'REJECT_INVALID_TARGET'],
+  ['market drift', 'REJECT_PRICE_DRIFT'],
+] as const)(
+  'closes the notification path on %s',
+  async (failure, reasonCode) => {
+    migrateDatabase(db);
+    const market = marketFixture();
+    const reviewer = vi.fn<ReviewProvider>(async () => {
+      switch (failure) {
+        case 'reject':
+          return reviewResponse({
+            decision: 'REJECT',
+            rejectReason: '样本风险过高',
+          });
+        case 'low confidence':
+          return reviewResponse({ confidenceScore: 69 });
+        case 'bad output':
+          return { ...reviewResponse(), output_text: '{broken' };
+        case 'refusal':
+          return {
+            ...reviewResponse(),
+            output: [{ type: 'message', content: [{ type: 'refusal' }] }],
+          };
+        case 'incomplete':
+          return { ...reviewResponse(), status: 'incomplete' };
+        case 'timeout':
+          throw Object.assign(new Error('fixture transport'), {
+            name: 'APIConnectionTimeoutError',
+          });
+        case 'invalid price':
+        case 'weak R:R':
+          return reviewResponse({
+            decision: 'MODIFY',
+            levelAdjustment: {
+              stopPrice: null,
+              takeProfits: [
+                {
+                  targetPrice: failure === 'weak R:R' ? '100.42' : '105.025',
+                  closePct: 100,
+                  management: 'FIXED',
+                  trailPolicy: 'NONE',
+                },
+              ],
+            },
+          });
+        case 'market drift': {
+          const quote = market.data.strategyMarket().quote;
+          market.overrideQuote({
+            ...quote,
+            bid: { ...quote.bid, value: '103.04' },
+            ask: { ...quote.ask, value: '103.06' },
+          });
+          return reviewResponse();
+        }
+        default:
+          throw new Error('unexpected provider call');
+      }
+    });
+    const { queue, fake } = await paired(
+      market,
+      aiConfig(failure === 'budget' ? '0' : '1'),
+      fakeTelegram(),
+      reviewer,
+    );
+    const id = market.candidate();
+    await queue.tickSignals();
+    await queue.tickOutbox();
+    expect(signalDetail(db, id)).toMatchObject({
+      deliveryPending: false,
+      finalRisk: { outcome: 'REJECTED', reasonCode },
+      signalId: null,
+      aiReview: { model: 'gpt-6-luna' },
+    });
+    expect(fake.sent).toHaveLength(0);
+    expect(reviewer).toHaveBeenCalledTimes(failure === 'budget' ? 0 : 1);
+  },
+);
+
+test('keeps an interrupted AI reservation on restart and does not repeat the paid review', async () => {
+  migrateDatabase(db);
+  const reviewer = vi.fn<ReviewProvider>(async () => reviewResponse());
+  const { queue, market, fake, settings } = await paired(
+    marketFixture(),
+    aiConfig(),
+    fakeTelegram(),
+    reviewer,
+  );
+  const id = market.candidate();
+  const current = queue.ai.current();
+  db.insert(aiReviews)
+    .values({
+      id: randomUUID(),
+      candidateId: id,
+      pairingId: queue.telegram.current().pairing!.id,
+      model: current.model,
+      promptVersion: 'market-sentinel-review-v1',
+      settingsRevision: current.revision,
+      confidenceThreshold: 70,
+      status: 'RUNNING',
+      requestSummary: {},
+      day: '2026-11-24',
+      reservedMicros: 500,
+      createdAtMs: clock,
+      startedAtMs: clock,
+    })
+    .run();
+  const restarted = createNotifications(
+    db,
+    settings,
+    market.data,
+    () => undefined,
+    {
+      fetchTelegram: fake.transport,
+      reviewOpenAI: reviewer,
+    },
+  );
+  await restarted.tickSignals();
+  await restarted.tickOutbox();
+  expect(signalDetail(db, id)).toMatchObject({
+    finalRisk: { reasonCode: 'AI_REVIEW_INTERRUPTED' },
+    aiReview: { status: 'FAILED', reservedUsd: 0.0005, costUsd: null },
+  });
+  expect(reviewer).not.toHaveBeenCalled();
+  expect(fake.sent).toHaveLength(0);
+});
+
+test('reuses a finished AI audit when final approval and enqueue must be retried', async () => {
+  migrateDatabase(db);
+  const reviewer = vi.fn<ReviewProvider>(async () => reviewResponse());
+  const { queue, market, fake, settings } = await paired(
+    marketFixture(),
+    aiConfig(),
+    fakeTelegram(),
+    reviewer,
+  );
+  const id = market.candidate();
+  db.$client.exec(
+    "CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox_messages BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END",
+  );
+  await expect(queue.tickSignals()).rejects.toThrow(
+    'insert into "outbox_messages"',
+  );
+  expect(signalDetail(db, id)).toMatchObject({
+    deliveryPending: true,
+    finalRisk: null,
+    aiReview: { status: 'COMPLETED' },
+  });
+  db.$client.exec('DROP TRIGGER fail_outbox');
+  const restarted = createNotifications(
+    db,
+    settings,
+    market.data,
+    () => undefined,
+    {
+      fetchTelegram: fake.transport,
+      reviewOpenAI: reviewer,
+    },
+  );
+  await restarted.tickSignals();
+  await restarted.tickOutbox();
+  expect(reviewer).toHaveBeenCalledTimes(1);
+  expect(signalDetail(db, id)?.delivery?.status).toBe('SENT');
+});
+
+test('reserves an in-flight review before a concurrent test can use the same daily budget', async () => {
+  migrateDatabase(db);
+  const response = Promise.withResolvers<unknown>();
+  const reviewer = vi
+    .fn<ReviewProvider>(async () => reviewResponse())
+    .mockImplementationOnce(() => response.promise);
+  const { queue, market } = await paired(
+    marketFixture(),
+    aiConfig('0.0015'),
+    fakeTelegram(),
+    reviewer,
+  );
+  market.candidate();
+  const pending = queue.tickSignals();
+  try {
+    expect(reviewer).toHaveBeenCalledTimes(1);
+    expect(queue.ai.usage().reservedUsd).toBeGreaterThan(0);
+    const result = await queue.testAi(actor);
+    expect(result.lastTest?.reasonCode).toBe('AI_BUDGET_EXHAUSTED');
+    expect(reviewer).toHaveBeenCalledTimes(1);
+  } finally {
+    response.resolve(reviewResponse());
+    await pending;
+  }
+  expect(queue.ai.usage()).toMatchObject({
+    calls: 1,
+    reservedUsd: 0,
+    spentUsd: 0.00008,
+  });
 });

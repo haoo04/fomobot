@@ -39,6 +39,7 @@ import {
 import { duration, type OpenInterest } from '../src/market-data/model.js';
 import { createMarketData } from '../src/market-data/service.js';
 import { saveOi, storeCandles } from '../src/market-data/store.js';
+import { createNotifications } from '../src/notification/service.js';
 import {
   markets,
   monitorConfigs,
@@ -250,6 +251,7 @@ function liveFixture(market: Market, quote: MarketQuote | null) {
   runtime.start();
   return {
     runtime,
+    data,
     fail,
     clock: (ms: number) => {
       clock = ms;
@@ -400,6 +402,60 @@ test.each([
       });
   },
 );
+
+test('delivers a live Bitget candidate from closed candle and OI evidence through final risk', async () => {
+  migrateDatabase(db);
+  const { market } = seedMarket('BITGET', 'PERP');
+  const trigger = loadHistory(market, 'LONG');
+  saveOi(db, openInterest(market.id));
+  const fixture = liveFixture(market, book(Number(trigger.close), closeTime));
+  const config = readConfig({
+    TELEGRAM_BOT_TOKEN: '1234567:fixture_token',
+    APP_ENCRYPTION_KEY_BASE64: randomBytes(32).toString('base64'),
+    SESSION_SECRET: randomBytes(32).toString('base64'),
+  });
+  let code = '';
+  const sent = vi.fn();
+  const queue = createNotifications(db, config, fixture.data, fixture.fail, {
+    fetchTelegram: async (url, request) => {
+      const method = String(url).split('/').at(-1);
+      if (method === 'getMe')
+        return Response.json({ ok: true, result: { username: 'fixture_bot' } });
+      if (method === 'getUpdates')
+        return Response.json({
+          ok: true,
+          result: [
+            {
+              update_id: 4,
+              message: {
+                text: '/start ' + code,
+                chat: { type: 'private', id: 42 },
+                from: { id: 42, is_bot: false },
+              },
+            },
+          ],
+        });
+      sent(JSON.parse(String(request?.body)));
+      return Response.json({ ok: true, result: { message_id: 101 } });
+    },
+  });
+  code = (await queue.telegram.pair('fixture')).code;
+  await queue.tickPair();
+  fixture.emit(trigger);
+  fixture.runtime.tick();
+  await queue.tickSignals();
+  await queue.tickOutbox();
+  expect(sent).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      chat_id: '42',
+      text: expect.stringContaining('OI 达到策略阈值'),
+    }),
+  );
+  expect(history()[0]).toMatchObject({
+    finalRisk: { outcome: 'PASSED' },
+    delivery: { status: 'SENT', telegramMessageId: '101' },
+  });
+});
 
 test('waits for simultaneous closes and ignores future candles, repeated events and restart backfill', () => {
   migrateDatabase(db);

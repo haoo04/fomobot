@@ -3,6 +3,10 @@ import { EXCHANGES, MARKET_TYPES, TIMEFRAMES } from '@market-sentinel/domain';
 import type { MarketCapabilities, Timeframe } from '@market-sentinel/domain';
 import type { MarketQuote } from '@market-sentinel/contracts/markets';
 import type {
+  AiModel,
+  AiReviewResult,
+} from '@market-sentinel/contracts/notifications';
+import type {
   CandidateDirection,
   CandidateReview,
   RiskLevels,
@@ -296,6 +300,10 @@ export const signals = sqliteTable('signals', {
   levels: text('levels_json', { mode: 'json' }).$type<RiskLevels>().notNull(),
   approvedAtMs: integer('approved_at_ms').notNull(),
   expiresAtMs: integer('expires_at_ms').notNull(),
+  mode: text('mode', { enum: ['RULE_ONLY', 'AI_REVIEW'] })
+    .notNull()
+    .default('RULE_ONLY'),
+  aiRevision: text('ai_revision'),
 });
 
 export const outboxMessages = sqliteTable(
@@ -327,4 +335,53 @@ export const outboxMessages = sqliteTable(
     index('outbox_signal').on(table.signalId),
     index('outbox_send_day').on(table.sendDay),
   ],
+);
+
+export const aiSettings = sqliteTable(
+  'ai_settings',
+  {
+    id: integer('id').primaryKey(),
+    keyRef: text('key_ref').references(() => secretStore.id),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull(),
+    model: text('model').$type<AiModel>().notNull(),
+    confidenceThreshold: integer('confidence_threshold').notNull(),
+    dailyBudgetMicros: integer('daily_budget_micros').notNull(),
+    timeoutMs: integer('timeout_ms').notNull(),
+    maxOutputTokens: integer('max_output_tokens').notNull(),
+    revision: text('revision').notNull(),
+  },
+  (table) => [check('ai_singleton', sql`${table.id} = 1`)],
+);
+
+export const aiReviews = sqliteTable(
+  'ai_reviews',
+  {
+    id: text('id').primaryKey(),
+    candidateId: text('candidate_id')
+      .unique()
+      .references(() => signalCandidates.id),
+    pairingId: text('pairing_id'),
+    model: text('model').$type<AiModel>().notNull(),
+    reportedModel: text('reported_model'),
+    promptVersion: text('prompt_version').notNull(),
+    settingsRevision: text('settings_revision').notNull(),
+    confidenceThreshold: integer('confidence_threshold').notNull(),
+    status: text('status', {
+      enum: ['RUNNING', 'COMPLETED', 'FAILED'],
+    }).notNull(),
+    requestSummary: text('request_summary_json', { mode: 'json' })
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    result: text('result_json', { mode: 'json' }).$type<AiReviewResult>(),
+    reasonCode: text('reason_code'),
+    day: text('day').notNull(),
+    reservedMicros: integer('reserved_micros').notNull(),
+    costMicros: integer('cost_micros'),
+    inputTokens: integer('input_tokens'),
+    outputTokens: integer('output_tokens'),
+    createdAtMs: integer('created_at_ms').notNull(),
+    startedAtMs: integer('started_at_ms'),
+    completedAtMs: integer('completed_at_ms'),
+  },
+  (table) => [index('ai_reviews_day').on(table.day)],
 );

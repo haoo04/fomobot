@@ -12,6 +12,10 @@ const algorithm = 'aes-256-gcm';
 const keyVersion = 1;
 const authTagLength = 16;
 
+export function maskSecret(secret: string | null) {
+  return secret ? '••••' + (secret.length > 4 ? secret.slice(-4) : '') : null;
+}
+
 export function saveSecret(
   database: Pick<AppDatabase, 'insert'>,
   keyBase64: string,

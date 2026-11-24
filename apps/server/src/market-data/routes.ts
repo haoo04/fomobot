@@ -383,6 +383,7 @@ export function registerMarketRoutes(
         ...service.diagnostics(),
         timeZone,
         notifications: notifications.diagnostics(),
+        ai: notifications.ai.usage(),
       },
     };
   });

@@ -12,6 +12,7 @@ import type { AppConfig } from './config.js';
 import type { AppDatabase } from './database.js';
 import { registerMarketRoutes } from './market-data/routes.js';
 import { createMarketData, type MarketData } from './market-data/service.js';
+import type { ReviewProvider } from './notification/ai.js';
 import { registerNotificationRoutes } from './notification/routes.js';
 import { createNotifications } from './notification/service.js';
 import { administrators } from './schema.js';
@@ -28,7 +29,7 @@ export async function buildApp(
   database: AppDatabase,
   config: AppConfig,
   marketData: MarketData = createMarketData(database),
-  options: { fetchTelegram?: typeof fetch } = {},
+  options: { fetchTelegram?: typeof fetch; reviewOpenAI?: ReviewProvider } = {},
 ) {
   const app = Fastify({
     bodyLimit: 8_192,
@@ -112,7 +113,7 @@ export async function buildApp(
         { code: 'NOTIFICATION_TASK_FAILED' },
         'Notification task failed',
       ),
-    options.fetchTelegram,
+    options,
   );
   await app.register(
     async (api) => {

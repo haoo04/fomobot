@@ -11,7 +11,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
 import { request } from './api';
-import { deliveryLabels } from './NotificationSettings';
+import { aiFailureLabels, deliveryLabels } from './NotificationSettings';
 
 const outcomes = {
   WAITING: '等待收盘',
@@ -22,7 +22,9 @@ const outcomes = {
   WATCH_ONLY: '现货观察',
 };
 const directions = { LONG: '做多', SHORT: '做空', BEARISH_WATCH: '偏空观察' };
+const aiDecisions = { ACCEPT: '接受', REJECT: '拒绝', MODIFY: '修改' };
 const reasons: Record<string, string> = {
+  ...aiFailureLabels,
   AWAITING_CLOSE: '等待确认及趋势周期的收盘数据',
   WARMING: '有效 K 线不足，等待预热',
   REJECT_INCOMPLETE_CANDLE: '关键周期缺少完整收盘 K 线',
@@ -416,6 +418,7 @@ export function StrategyPanel({
                   {item.delivery &&
                     ' · ' + deliveryLabels[item.delivery.status]}
                   {item.deliveryPending && ' · 待终审'}
+                  {item.aiDecision && ' · AI ' + aiDecisions[item.aiDecision]}
                 </strong>
                 <small>
                   {formatTime(item.triggerCloseMs)} · {item.triggerTimeframe}
@@ -468,7 +471,13 @@ export function StrategyPanel({
                 </p>
               )}
               {signal.signalId && (
-                <p className="market-meta">正式信号 {signal.signalId}</p>
+                <p className="market-meta">
+                  正式信号 {signal.signalId}
+                  {' · ' +
+                    (signal.signalMode === 'AI_REVIEW'
+                      ? 'AI 审核'
+                      : '规则模式')}
+                </p>
               )}
               {signal.deliveries.map((delivery) => (
                 <p className="market-meta" key={String(delivery.manual)}>
@@ -503,6 +512,56 @@ export function StrategyPanel({
                   {resend.error.message}
                 </p>
               )}
+              {signal.aiReview && (
+                <details open>
+                  <summary>AI 审核详情</summary>
+                  <p className="market-meta">
+                    {signal.aiReview.reportedModel ?? signal.aiReview.model}
+                    {' · ' + signal.aiReview.promptVersion}
+                    {signal.aiReview.result &&
+                      ' · ' +
+                        aiDecisions[signal.aiReview.result.decision] +
+                        ' · 主观评分 ' +
+                        signal.aiReview.result.confidenceScore +
+                        '/100'}
+                    {signal.aiReview.reasonCode &&
+                      ' · ' +
+                        (reasons[signal.aiReview.reasonCode] ??
+                          signal.aiReview.reasonCode)}
+                  </p>
+                  {signal.aiReview.result?.rejectReason && (
+                    <p>{signal.aiReview.result.rejectReason}</p>
+                  )}
+                  {signal.aiReview.result?.rationale.map((reason, index) => (
+                    <p key={index}>{reason}</p>
+                  ))}
+                  {!!signal.aiReview.result?.riskFlags.length && (
+                    <p className="market-meta">
+                      风险 {signal.aiReview.result.riskFlags.join(' · ')}
+                    </p>
+                  )}
+                  {signal.aiReview.inputTokens !== null && (
+                    <p className="market-meta">
+                      输入 {signal.aiReview.inputTokens} / 输出{' '}
+                      {signal.aiReview.outputTokens} tokens · 估算 USD{' '}
+                      {signal.aiReview.costUsd?.toFixed(6)}
+                    </p>
+                  )}
+                  <details>
+                    <summary>审核请求与结果</summary>
+                    <pre>
+                      {JSON.stringify(
+                        {
+                          request: signal.aiReview.requestSummary,
+                          result: signal.aiReview.result,
+                        },
+                        null,
+                        2,
+                      )}
+                    </pre>
+                  </details>
+                </details>
+              )}
               {levels && (
                 <dl className="market-facts">
                   <div>
@@ -519,6 +578,12 @@ export function StrategyPanel({
                         TP{i + 1}（{target.closePct}%）
                       </dt>
                       <dd>{target.price}</dd>
+                      {target.trailPolicy === 'BREAKEVEN_AFTER_TP1' && (
+                        <dd>TP1 后移至保本</dd>
+                      )}
+                      {target.trailPolicy === 'ATR_TRAIL_AFTER_TP1' && (
+                        <dd>TP1 后按触发周期 1.5×ATR 移动止损</dd>
+                      )}
                     </div>
                   ))}
                   <div>
@@ -531,7 +596,11 @@ export function StrategyPanel({
                 <summary>计算证据与参数快照</summary>
                 <pre>
                   {JSON.stringify(
-                    { ...signal.evidence, params: signal.params },
+                    {
+                      ...signal.evidence,
+                      params: signal.params,
+                      finalQuote: signal.finalRisk?.quote,
+                    },
                     null,
                     2,
                   )}
